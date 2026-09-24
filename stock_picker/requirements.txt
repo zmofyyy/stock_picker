@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn>=0.27
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0
+pytdx>=1.72

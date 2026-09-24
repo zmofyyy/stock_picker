@@ -1,0 +1,40 @@
+{
+  "tdx_dir": "D:\\new_tdx",
+  "host": "127.0.0.1",
+  "port": 8778,
+  "reader_mode": "fast",
+  "names_csv": "",
+  "screen": {
+    "ma_window": 20,
+    "volume_ratio": 2.0,
+    "lookback_days": 1,
+    "min_bars": 30,
+    "max_results": 300,
+    "min_amount": 0.0,
+    "max_float_mcap": 150.0,
+    "exclude_st": true,
+    "markets": [
+      "sh",
+      "sz",
+      "bj"
+    ],
+    "exclude_boards": [
+      "科创板",
+      "创业板",
+      "北交所"
+    ]
+  },
+  "plan": {
+    "sell_profit": 0.045,
+    "buy_discount": 0.0
+  },
+  "cache_bars": 0,
+  "bootstrap": {
+    "preload": true,
+    "refresh_if_stale": true,
+    "auto_screen": true
+  },
+  "notify": {
+    "console": true
+  }
+}

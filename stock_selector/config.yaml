@@ -1,0 +1,157 @@
+# ============================================================
+# stock_selector 全局配置
+# 说明：
+#   1. 所有路径、策略参数、追踪参数、通知参数均在此处配置；
+#   2. 命令行参数 / Web UI 提交的参数优先级高于本文件；
+#   3. 支持在配置中写相对路径，相对路径以本文件所在目录为基准。
+# ============================================================
+
+# ---------------- 数据源 ----------------
+data:
+  # 通达信安装目录（Windows 示例：C:/new_tdx 或 D:/通达信/vipdoc 的上级目录）
+  # 目录下应当存在 vipdoc/sh/lday、vipdoc/sz/lday、vipdoc/bj/lday
+  tdx_dir: "C:/new_tdx"
+  # 缓存目录
+  cache_dir: "./cache"
+  # 缓存格式：parquet（需 pyarrow）或 pickle
+  cache_format: "parquet"
+  # 读取起始日期，早于该日期的数据会被丢弃
+  start_date: "2015-01-01"
+  # 默认股票池（为空则扫描通达信本地目录自动生成）
+  universe: []
+  # 是否排除 ST / 退市股（按文件名无法判断，这里按代码前缀做粗略过滤）
+  exclude_st: false
+  # 复权模式：none（默认，本地通达信日线为不复权）/ qfq / hfq
+  # !!! 本地通达信 .day 文件是不复权数据，若配置为 qfq/hfq 且无除权除息数据，
+  #     系统会在日志和 Web UI 中给出明确警告，不会静默返回错误结果。
+  adjust: "none"
+  # 除权除息数据文件（可选，CSV：code,date,cash_dividend,split_ratio）
+  adjust_file: ""
+  # 股票基础信息文件（流通股本 / 总股本 / 行业）
+  # 留空时默认为 <cache_dir>/stock_basic.csv
+  # CSV 表头：code,name,float_shares,total_shares,industry
+  # float_shares 单位统一为「股」，同时兼容 "65.7亿" / "3500万" 这类写法
+  # 说明：通达信 .day 文件不含股本信息，流通盘类策略（volume_surge）依赖此文件；
+  #       文件缺失时相关股票会被剔除（不会伪造股本），并在日志与 Web UI 中提示。
+  basics_file: ""
+
+# ---------------- 策略 ----------------
+strategy:
+  default: "ma_cross"
+  ma_cross:
+    short_window: 5
+    long_window: 20
+  rsi:
+    period: 14
+    buy_threshold: 30
+    sell_threshold: 70
+  volume_breakout:
+    high_window: 20
+    volume_ratio: 2.0
+    volume_ma_window: 5
+  # 小盘放量：流通盘小于阈值 + 成交量达到 20 日均量 2 倍
+  volume_surge:
+    volume_ma_window: 20            # 均量窗口（需求口径：20 日）
+    volume_ratio: 2.0               # 放量倍数（需求口径：2 倍）
+    cap_metric: "float_market_cap"  # float_market_cap=流通市值（亿元）/ float_shares=流通股本（亿股）
+    max_float_market_cap: 150       # 流通市值上限（亿元）
+    max_float_shares: 150           # 流通股本上限（亿股）
+    exclude_current_volume: true    # 均量不含当日（用前 N 日均量作基准）
+    exit_ma_window: 20              # 跌破该均线卖出
+    use_ma_exit: true
+    allow_missing_basics: false     # 缺少流通股本时是否放行（默认否）
+
+# ---------------- 选股 ----------------
+screen:
+  # 选股时至少需要多少根历史 K 线才参与计算
+  min_bars: 60
+  # 结果最多返回多少只
+  max_results: 200
+
+# ---------------- 回测 ----------------
+backtest:
+  initial_cash: 1000000      # 初始资金
+  commission: 0.0003         # 佣金费率（双边）
+  stamp_tax: 0.001           # 印花税（仅卖出）
+  slippage: 0.0002           # 滑点率
+  max_positions: 10          # 最大持仓数量
+  position_sizing: "equal"   # equal=等权 / fixed=固定资金
+  fixed_amount: 100000       # position_sizing=fixed 时每笔固定金额
+  min_commission: 5.0        # 最低佣金
+  # 成交时点：next_open=T+1开盘 / next_close=T+1收盘 / close=T日收盘
+  exec_price: "next_open"
+  # 涨跌停幅度（主板 10%，创业板/科创板 20%）
+  limit_pct: 0.10
+  limit_pct_star: 0.20
+  # 是否启用 T+1 限制（当日买入不可卖出）
+  t_plus_1: true
+  # 基准指数：000300.SH=沪深300 / 000001.SH=上证指数
+  benchmark: "000300.SH"
+  # 无风险利率（年化），用于夏普比率
+  risk_free_rate: 0.02
+  # 年化交易日数
+  trading_days: 252
+
+# ---------------- 追踪 ----------------
+tracker:
+  enabled: true
+  storage: "sqlite:///tracking.db"
+  update_time: "15:30"       # 每日自动更新时间
+  auto_update: false         # 是否开启定时任务
+  # 支持的状态（可自定义扩展，顺序即状态机默认流转顺序）
+  states:
+    - 候选
+    - 观察
+    - 触发
+    - 买入
+    - 持仓
+    - 减仓
+    - 清仓
+    - 止盈
+    - 止损
+    - 失效
+    - 暂停
+  # 需要重点提醒的状态
+  alert_states:
+    - 买入
+    - 清仓
+    - 止盈
+    - 止损
+    - 失效
+  # 风险判定参数
+  risk:
+    near_stop_ratio: 0.02    # 距止损价 2% 以内视为接近止损
+    volume_drop_ratio: 0.6   # 放量下跌：量比>1.5 且跌幅超过 3%
+    vol_spike_ratio: 1.5
+    drop_pct: 0.03
+    break_ma_window: 20      # 跌破 N 日均线视为风险
+  notify:
+    console: true
+    csv: true
+    csv_path: "./reports/alerts.csv"
+    webhook: ""              # 钉钉/企业微信/飞书 Webhook 地址
+    webhook_type: "dingtalk" # dingtalk / wecom / feishu
+    webhook_secret: ""
+    email: ""                # 收件人邮箱，留空表示不开启
+    smtp_host: ""
+    smtp_port: 465
+    smtp_user: ""
+    smtp_password: ""
+    smtp_ssl: true
+
+# ---------------- Web ----------------
+web:
+  host: "0.0.0.0"
+  port: 8000
+  # 允许跨域的前端地址
+  cors_origins:
+    - "http://localhost:5173"
+    - "http://127.0.0.1:5173"
+  # 是否挂载前端构建产物（frontend/dist）
+  serve_frontend: true
+
+# ---------------- 日志 ----------------
+logging:
+  level: "INFO"
+  file: "./logs/stock_selector.log"
+  console: true

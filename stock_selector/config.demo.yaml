@@ -1,0 +1,101 @@
+data:
+  tdx_dir: D:\new_tdx
+  cache_dir: ./cache
+  cache_format: parquet
+  start_date: '2023-01-01'
+  universe: []
+  exclude_st: false
+  adjust: none
+  adjust_file: ''
+  basics_file: ''
+strategy:
+  default: ma_cross
+  ma_cross:
+    short_window: 5
+    long_window: 20
+    volume_ma_window: 5
+    volume_ratio: 0
+    confirm_days: 0
+  rsi:
+    period: 14
+    buy_threshold: 30
+    sell_threshold: 70
+    require_turn: true
+  volume_breakout:
+    high_window: 20
+    volume_ratio: 2
+    volume_ma_window: 5
+    exit_ma_window: 10
+    use_ma_exit: true
+  volume_surge:
+    volume_ma_window: 20
+    volume_ratio: 2
+    cap_metric: float_market_cap
+    max_float_market_cap: 150
+    max_float_shares: 150
+    exclude_current_volume: true
+    exit_ma_window: 20
+    use_ma_exit: true
+    allow_missing_basics: false
+screen:
+  min_bars: 60
+  max_results: 200
+backtest:
+  initial_cash: 1000000
+  commission: 0.0003
+  stamp_tax: 0.001
+  slippage: 0.0002
+  max_positions: 10
+  position_sizing: equal
+  fixed_amount: 100000
+  min_commission: 5.0
+  exec_price: next_open
+  limit_pct: 0.1
+  limit_pct_star: 0.2
+  t_plus_1: true
+  benchmark: 000300.SH
+  risk_free_rate: 0.02
+  trading_days: 252
+tracker:
+  enabled: true
+  storage: sqlite:///./tracking_demo.db
+  update_time: '15:30'
+  auto_update: false
+  states: []
+  alert_states:
+  - 买入
+  - 清仓
+  - 止盈
+  - 止损
+  - 失效
+  risk:
+    near_stop_ratio: 0.02
+    volume_drop_ratio: 0.6
+    vol_spike_ratio: 1.5
+    drop_pct: 0.03
+    break_ma_window: 20
+  notify:
+    console: true
+    csv: true
+    csv_path: ./reports/alerts.csv
+    webhook: ''
+    webhook_type: dingtalk
+    webhook_secret: ''
+    email: ''
+    smtp_host: ''
+    smtp_port: 465
+    smtp_user: ''
+    smtp_password: ''
+    smtp_ssl: true
+web:
+  host: 127.0.0.1
+  port: 8000
+  cors_origins:
+  - http://localhost:5173
+  - http://127.0.0.1:5173
+  serve_frontend: true
+logging:
+  level: INFO
+  file: ./logs/stock_selector.log
+  console: true
+log: {}

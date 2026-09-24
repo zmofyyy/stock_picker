@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>放量选股工具 · stock_picker</title>
+  <link rel="icon" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/style.css?v=__ASSET_VER__" />
+</head>
+<body>
+  <!-- 服务端换了前端资源、而当前标签页还跑着旧脚本时出现（见 app.js::loadVersion） -->
+  <div class="stale-banner" id="staleBanner" hidden>
+    <span>程序已更新，本页仍是旧版本（部分功能可能不对）。</span>
+    <button type="button" class="mini" id="staleReload">刷新页面</button>
+  </div>
+
+  <!-- ============ 侧栏（毛玻璃） ============ -->
+  <aside class="sidebar">
+    <div class="traffic"><i></i><i></i><i></i></div>
+
+    <div class="brand">
+      <div class="brand-mark">📈</div>
+      <div class="brand-text">
+        <h1>放量选股</h1>
+        <p>stock_picker</p>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="tab active" data-tab="screen">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01" />
+        </svg>
+        <span>选股</span>
+      </button>
+      <button class="tab" data-tab="streak">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 20h18" />
+          <path d="M4 20v-2.5h4.5V15h4.5v-2.5H17.5V10H21" />
+        </svg>
+        <span>连板梯队</span>
+      </button>
+      <button class="tab" data-tab="intersect">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="9.6" cy="12" r="6.3" />
+          <circle cx="14.4" cy="12" r="6.3" />
+        </svg>
+        <span>板块交集</span>
+      </button>
+      <button class="tab" data-tab="plan">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M9 11.5l2.5 2.5L20 5" />
+          <path d="M20 12.5V19a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9" />
+        </svg>
+        <span>计划</span><b id="planCount">0</b>
+      </button>
+      <button class="tab" data-tab="watch">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="8.5" />
+          <circle cx="12" cy="12" r="3.2" />
+        </svg>
+        <span>追踪</span><b id="watchCount">0</b>
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="foot-title">数据源</div>
+      <div class="status" id="statusPills"></div>
+    </div>
+  </aside>
+
+  <!-- ============ 工作区 ============ -->
+  <div class="workspace">
+    <header class="toolbar">
+      <div class="toolbar-title">
+        <h2 id="viewTitle">选股</h2>
+        <p id="viewSub">本地通达信日线 · 放量 ≥ N 倍 M 日均量 · 计划买入/卖出价 · 追踪</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="btnBackup" title="立刻生成一份 SQLite 一致性快照">备份数据</button>
+        <button class="btn" id="btnVerify" title="抽样比对 pytdx 与向量化解析结果">数据自检</button>
+        <button class="btn" id="btnNames" title="重新解析通达信名称表">重建名称</button>
+        <button class="btn primary" id="btnRefresh">刷新数据</button>
+      </div>
+    </header>
+
+    <div class="progressbar" id="progressBar" hidden>
+      <div class="fill" id="progressFill"></div>
+      <span class="txt" id="progressText">准备中…</span>
+    </div>
+
+    <main>
+      <!-- ============ 选股 ============ -->
+      <section class="panel active" id="panel-screen">
+        <div class="card">
+          <div class="filters">
+            <label>均量窗口
+              <input type="number" id="fMaWindow" value="20" min="2" max="250" />
+            </label>
+            <label>放量倍数
+              <input type="number" id="fRatio" value="2" step="0.1" min="0.5" max="20" />
+            </label>
+            <label>回看交易日
+              <input type="number" id="fLookback" value="1" min="1" max="60" />
+            </label>
+            <label>指定日期
+              <span class="date-field">
+                <input type="date" id="fDate" title="留空＝最新交易日；仅支持交易日" />
+                <button type="button" class="mini" id="fDateLatest" title="清除，回到最新交易日">最新</button>
+              </span>
+            </label>
+            <label>最小成交额(亿)
+              <input type="number" id="fMinAmount" value="0" step="0.5" min="0" />
+            </label>
+            <label>最大流通市值(亿)
+              <input type="number" id="fMaxFloatMcap" value="150" step="10" min="0" title="0 = 不限；流通市值 = 流通股本 × 当日收盘价，股本取自本地 gbbq" />
+            </label>
+            <label>交易所
+              <span class="mk-group">
+                <span class="mk"><input type="checkbox" class="fMk" value="sh" checked /> 沪</span>
+                <span class="mk"><input type="checkbox" class="fMk" value="sz" checked /> 深</span>
+                <span class="mk"><input type="checkbox" class="fMk" value="bj" checked /> 京</span>
+              </span>
+            </label>
+            <label>板块
+              <span class="mk-group">
+                <span class="mk"><input type="checkbox" class="fBd" value="主板" checked /> 主板</span>
+                <span class="mk"><input type="checkbox" class="fBd" value="创业板" /> 创业板</span>
+                <span class="mk"><input type="checkbox" class="fBd" value="科创板" /> 科创板</span>
+                <span class="mk"><input type="checkbox" class="fBd" value="北交所" /> 北交所</span>
+              </span>
+            </label>
+            <label>二级行业
+              <select id="fIndustry"><option value="">全部行业</option></select>
+            </label>
+            <label>概念
+              <span class="concept-field">
+                <input id="fConcept" list="conceptList" placeholder="概念名，可逗号分隔"
+                       title="输入或从下拉选择概念；多个概念用逗号分隔" />
+                <select id="fConceptMode" title="多个概念时的匹配方式：任一命中 / 全部命中">
+                  <option value="any">任一</option>
+                  <option value="all">全部</option>
+                </select>
+                <button type="button" class="mini" id="fConceptClear" title="清除概念筛选">清除</button>
+              </span>
+            </label>
+            <datalist id="conceptList"></datalist>
+            <label class="chk"><input type="checkbox" id="fExcludeSt" checked /> 剔除 ST/退市</label>
+            <label>卖出溢价 %
+              <input type="number" id="fSellProfit" value="4.5" step="0.1" min="0" max="100" />
+            </label>
+            <label>最多返回
+              <input type="number" id="fMaxResults" value="300" min="1" max="2000" />
+            </label>
+            <button class="btn primary" id="btnScreen">开始选股</button>
+          </div>
+          <ul class="conditions" id="conditions"></ul>
+        </div>
+
+        <div class="card" id="indSummaryCard" hidden>
+          <div class="card-head">
+            <h2>二级行业分布 <span class="muted" id="indSummaryMeta" title="分布基数是当前其他条件命中的股票数，不受行业/概念筛选影响；点标签即筛选，再点取消"></span></h2>
+            <button class="btn small" id="btnIndClear">清除行业筛选</button>
+          </div>
+          <div class="ind-summary" id="indSummary"></div>
+        </div>
+
+        <div class="card" id="conceptSummaryCard" hidden>
+          <div class="card-head">
+            <h2>概念分布 <span class="muted" id="conceptSummaryMeta" title="分布基数是当前其他条件命中的股票数，不受行业/概念筛选影响；点标签即筛选，再点取消"></span></h2>
+            <button class="btn small" id="btnConceptClear">清除概念筛选</button>
+          </div>
+          <div class="ind-summary" id="conceptSummary"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>选股结果 <span class="muted" id="screenMeta"></span></h2>
+            <div class="row-actions">
+              <span class="muted hint" id="sortHint"></span>
+              <button class="btn small" id="btnSortReset" hidden>恢复默认</button>
+              <button class="btn small" id="btnPlanAll">全部加入计划</button>
+              <button class="btn small" id="btnExport">导出 CSV</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table id="screenTable">
+              <thead>
+                <tr>
+                  <th class="sortable" data-sort="code" data-label="代码" title="点击按代码排序">代码</th>
+                  <th class="sortable" data-sort="name" data-label="名称" title="点击按名称排序">名称</th>
+                  <th class="sortable" data-sort="industry_l2" data-label="二级行业" title="点击按二级行业排序">二级行业</th>
+                  <th class="sortable" data-sort="concept_n" data-label="概念" title="点击按概念数量排序">概念</th>
+                  <th class="sortable" data-sort="signal_date" data-label="信号日" title="点击按信号日排序">信号日</th>
+                  <th class="num sortable" data-sort="close" data-label="收盘价" title="点击按收盘价排序">收盘价</th>
+                  <th class="num sortable" data-sort="pct_change" data-label="涨跌幅" title="点击按涨跌幅排序">涨跌幅</th>
+                  <th class="num sortable" data-sort="vol_ratio" data-label="量比" title="点击按量比排序">量比</th>
+                  <th class="num sortable" data-sort="float_mcap_yi" data-label="流通市值(亿)" title="点击按流通市值排序">流通市值(亿)</th>
+                  <th class="num sortable" data-sort="buy_price" data-label="计划买入价" title="点击按计划买入价排序">计划买入价</th>
+                  <th class="num sortable" data-sort="sell_price" data-label="计划卖出价" title="点击按计划卖出价排序">计划卖出价</th>
+                  <th class="num sortable" data-sort="volume_hand" data-label="成交量(万手)" title="点击按成交量排序">成交量(万手)</th>
+                  <th class="num sortable" data-w="ma" data-sort="ma_volume" data-label="20日均量(万手)" title="点击按20日均量排序">20日均量(万手)</th>
+                  <th class="num sortable" data-sort="amount_yi" data-label="成交额(亿)" title="点击按成交额排序">成交额(亿)</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 连板梯队 ============ -->
+      <section class="panel" id="panel-streak">
+        <div class="card">
+          <div class="filters">
+            <label>交易日
+              <span class="date-field">
+                <input type="date" id="sDate" title="留空＝最新交易日；仅支持交易日" />
+                <button type="button" class="mini" id="sDateLatest" title="清除，回到最新交易日">最新</button>
+              </span>
+            </label>
+            <label>最低连板
+              <input type="number" id="sMinStreak" value="1" min="1" max="20" />
+            </label>
+            <label>板块
+              <span class="mk-group">
+                <span class="mk"><input type="checkbox" class="sBd" value="主板" checked /> 主板</span>
+                <span class="mk"><input type="checkbox" class="sBd" value="创业板" checked /> 创业板</span>
+                <span class="mk"><input type="checkbox" class="sBd" value="科创板" checked /> 科创板</span>
+                <span class="mk"><input type="checkbox" class="sBd" value="北交所" checked /> 北交所</span>
+              </span>
+            </label>
+            <label class="chk" title="本机行情实测 ST 股（含主板）的日内带宽也是 10%，开启 5% 会多算涨停"><input type="checkbox" id="sStLimit" /> ST 按 5% 判定（默认关）</label>
+            <button class="btn primary" id="btnStreak">加载梯队</button>
+          </div>
+          <ul class="conditions" id="streakConditions"></ul>
+        </div>
+
+        <div class="card" id="streakKpiCard" hidden>
+          <div class="kpi-row" id="streakKpi"></div>
+        </div>
+
+        <div class="card" id="streakLadderCard" hidden>
+          <div class="card-head">
+            <h2>连板梯队 <span class="muted" id="streakLadderMeta"></span></h2>
+            <span class="muted hint">点个股标签可看 K 线</span>
+          </div>
+          <div class="ladder" id="streakLadder"></div>
+        </div>
+
+        <div class="card" id="streakChartCard" hidden>
+          <div class="card-head">
+            <h2>连板高度分布 <span class="muted" id="streakChartMeta"></span></h2>
+          </div>
+          <div class="chart" id="streakChart"></div>
+        </div>
+
+        <div class="card" id="streakIndCard" hidden>
+          <div class="card-head">
+            <h2>涨停股行业分布 <span class="muted" id="streakIndMeta" title="点标签即筛选，再点取消"></span></h2>
+            <button class="btn small" id="btnStreakIndClear">清除行业筛选</button>
+          </div>
+          <div class="ind-summary" id="streakIndSummary"></div>
+        </div>
+
+        <div class="card" id="streakCptCard" hidden>
+          <div class="card-head">
+            <h2>涨停股概念分布 <span class="muted" id="streakCptMeta" title="点标签即筛选，再点取消"></span></h2>
+            <button class="btn small" id="btnStreakCptClear">清除概念筛选</button>
+          </div>
+          <div class="ind-summary" id="streakCptSummary"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>涨停明细 <span class="muted" id="streakMeta"></span></h2>
+            <div class="row-actions">
+              <span class="muted hint" id="streakSortHint"></span>
+              <button class="btn small" id="streakSortReset" hidden>恢复默认</button>
+              <button class="btn small" id="btnStreakExport">导出 CSV</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table id="streakTable">
+              <thead>
+                <tr>
+                  <th class="sortable" data-sort="streak" data-label="连板" title="点击按连板数排序">连板</th>
+                  <th class="sortable" data-sort="code" data-label="代码" title="点击按代码排序">代码</th>
+                  <th class="sortable" data-sort="name" data-label="名称" title="点击按名称排序">名称</th>
+                  <th class="sortable" data-sort="seal" data-label="封板" title="点击按封板形态排序">封板</th>
+                  <th class="sortable" data-sort="industry_l2" data-label="二级行业" title="点击按二级行业排序">二级行业</th>
+                  <th class="sortable" data-sort="concept_n" data-label="概念" title="点击按概念数量排序">概念</th>
+                  <th class="num sortable" data-sort="close" data-label="收盘价" title="点击按收盘价排序">收盘价</th>
+                  <th class="num sortable" data-sort="pct_change" data-label="涨跌幅" title="点击按涨跌幅排序">涨跌幅</th>
+                  <th class="num sortable" data-sort="amount_yi" data-label="成交额(亿)" title="点击按成交额排序">成交额(亿)</th>
+                  <th class="num sortable" data-sort="float_mcap_yi" data-label="流通市值(亿)" title="点击按流通市值排序">流通市值(亿)</th>
+                  <th class="sortable" data-sort="limit_rate" data-label="涨跌幅限制" title="点击按涨跌幅限制排序">涨跌幅限制</th>
+                  <th class="sortable" data-sort="board" data-label="板块" title="点击按板块排序">板块</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 板块交集 ============ -->
+      <section class="panel" id="panel-intersect">
+        <div class="card">
+          <div class="filters">
+            <label>交易日
+              <span class="date-field">
+                <input type="date" id="xDate" title="留空＝最新交易日；仅支持交易日" />
+                <button type="button" class="mini" id="xDateLatest" title="清除，回到最新交易日">最新</button>
+              </span>
+            </label>
+            <label>板块
+              <span class="mk-group">
+                <span class="mk"><input type="checkbox" class="xBd" value="主板" checked /> 主板</span>
+                <span class="mk"><input type="checkbox" class="xBd" value="创业板" checked /> 创业板</span>
+                <span class="mk"><input type="checkbox" class="xBd" value="科创板" checked /> 科创板</span>
+                <span class="mk"><input type="checkbox" class="xBd" value="北交所" checked /> 北交所</span>
+              </span>
+            </label>
+            <label>交易所
+              <span class="mk-group">
+                <span class="mk"><input type="checkbox" class="xMk" value="sh" checked /> 沪</span>
+                <span class="mk"><input type="checkbox" class="xMk" value="sz" checked /> 深</span>
+                <span class="mk"><input type="checkbox" class="xMk" value="bj" checked /> 京</span>
+              </span>
+            </label>
+            <label class="chk"><input type="checkbox" id="xExcludeSt" checked /> 剔除 ST/退市</label>
+            <label>最小成交额(亿)
+              <input type="number" id="xMinAmount" value="0" step="0.5" min="0" />
+            </label>
+            <label>最大流通市值(亿)
+              <input type="number" id="xMaxMcap" value="0" step="10" min="0" title="0 = 不限；流通市值 = 流通股本 × 当日收盘价" />
+            </label>
+            <button class="btn primary" id="btnIntersect">求交集</button>
+            <button class="btn" id="btnIntersectClear">清空已选</button>
+          </div>
+          <ul class="conditions" id="intersectConditions"></ul>
+        </div>
+
+        <div class="card" id="intersectVennCard" hidden>
+          <div class="card-head">
+            <h2>集合关系 <span class="muted" id="intersectVennMeta"></span></h2>
+            <span class="muted hint">左圆＝二级行业选中集合 A，右圆＝概念选中集合 B，中间＝A ∩ B</span>
+          </div>
+          <div class="venn-wrap">
+            <div class="venn" id="intersectVenn"></div>
+            <div class="kpi-row" id="intersectKpi"></div>
+          </div>
+        </div>
+
+        <div class="card" id="intersectSuggestCard" hidden>
+          <div class="card-head">
+            <h2>没有交集，可以这样调 <span class="muted" id="intersectSuggestMeta"></span></h2>
+            <span class="muted hint">点标签直接并入条件</span>
+          </div>
+          <div class="suggest-block">
+            <div class="suggest-title" id="suggestIndTitle">A 里最常出现的概念（点一下加入概念侧）</div>
+            <div class="ind-summary" id="suggestConcepts"></div>
+          </div>
+          <div class="suggest-block">
+            <div class="suggest-title" id="suggestCptTitle">B 里最常出现的二级行业（点一下加入行业侧）</div>
+            <div class="ind-summary" id="suggestIndustries"></div>
+          </div>
+        </div>
+
+        <div class="pick-grid">
+          <div class="card">
+            <div class="card-head">
+              <h2>二级行业 <span class="muted" id="indPickMeta"></span></h2>
+              <div class="row-actions">
+                <input class="pick-search" id="indPickSearch" placeholder="搜索行业…" />
+                <button class="btn small" id="btnIndPickClear">清空</button>
+              </div>
+            </div>
+            <div class="pick-chosen" id="indPickChosen"></div>
+            <div class="pick-list" id="indPickList"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>概念 <span class="muted" id="cptPickMeta"></span></h2>
+              <div class="row-actions">
+                <label class="inline" title="多个概念时的匹配方式：任一命中（并集）/ 全部命中（交集）">匹配
+                  <select id="xCptMode">
+                    <option value="any">任一</option>
+                    <option value="all">全部</option>
+                  </select>
+                </label>
+                <input class="pick-search" id="cptPickSearch" placeholder="搜索概念…" />
+                <button class="btn small" id="btnCptPickClear">清空</button>
+              </div>
+            </div>
+            <div class="pick-chosen" id="cptPickChosen"></div>
+            <div class="pick-list" id="cptPickList"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>交集个股 <span class="muted" id="intersectMeta"></span></h2>
+            <div class="row-actions">
+              <span class="muted hint" id="intersectSortHint"></span>
+              <button class="btn small" id="intersectSortReset" hidden>恢复默认</button>
+              <button class="btn small" id="btnIntersectExport">导出 CSV</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table id="intersectTable">
+              <thead>
+                <tr>
+                  <th class="sortable" data-sort="code" data-label="代码" title="点击按代码排序">代码</th>
+                  <th class="sortable" data-sort="name" data-label="名称" title="点击按名称排序">名称</th>
+                  <th class="sortable" data-sort="industry_l2" data-label="二级行业" title="点击按二级行业排序">二级行业</th>
+                  <th class="sortable" data-sort="hit_n" data-label="命中概念" title="点击按命中概念数排序">命中概念</th>
+                  <th class="num sortable" data-sort="concept_n" data-label="概念数" title="点击按概念总数排序">概念数</th>
+                  <th class="num sortable" data-sort="close" data-label="收盘价" title="点击按收盘价排序">收盘价</th>
+                  <th class="num sortable" data-sort="pct_change" data-label="涨跌幅" title="点击按涨跌幅排序">涨跌幅</th>
+                  <th class="num sortable" data-sort="amount_yi" data-label="成交额(亿)" title="点击按成交额排序">成交额(亿)</th>
+                  <th class="num sortable" data-sort="float_mcap_yi" data-label="流通市值(亿)" title="点击按流通市值排序">流通市值(亿)</th>
+                  <th class="sortable" data-sort="board" data-label="板块" title="点击按板块排序">板块</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 计划 ============ -->
+      <section class="panel" id="panel-plan">
+        <div class="card">
+          <div class="card-head">
+            <h2>买卖计划 <span class="muted" id="planMeta"></span></h2>
+            <button class="btn small" id="btnPlanReload">刷新</button>
+          </div>
+          <div class="table-wrap">
+            <table id="planTable">
+              <thead>
+                <tr>
+                  <th>代码</th><th>名称</th><th>二级行业</th><th>信号日</th>
+                  <th class="num">放量日收盘</th><th class="num">量比</th>
+                  <th class="num">买入价</th><th class="num">卖出价</th><th class="num">数量</th>
+                  <th class="num">最新价</th><th class="num">距买入价</th>
+                  <th>状态</th><th>备注</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 追踪 ============ -->
+      <section class="panel" id="panel-watch">
+        <div class="card">
+          <div class="card-head">
+            <h2>追踪列表 <span class="muted" id="watchMeta"></span></h2>
+            <button class="btn small" id="btnWatchReload">刷新</button>
+          </div>
+          <div class="table-wrap">
+            <table id="watchTable">
+              <thead>
+                <tr>
+                  <th>代码</th><th>名称</th><th>二级行业</th><th>信号日</th>
+                  <th class="num">买入价</th><th class="num">卖出价</th><th class="num">数量</th>
+                  <th class="num">最新价</th><th class="num">区间最低</th><th class="num">区间最高</th>
+                  <th>已到买入价</th><th>已达卖出价</th><th class="num">收益率</th>
+                  <th>状态</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============ K 线抽屉 ============ -->
+  <div class="drawer-mask" id="drawerMask" hidden></div>
+  <aside class="drawer" id="drawer" hidden>
+    <div class="drawer-head">
+      <div>
+        <h3 id="drawerTitle">—</h3>
+        <p class="muted" id="drawerSub"></p>
+      </div>
+      <div class="row-actions">
+        <label class="inline">K线根数
+          <input type="number" id="klineBars" value="160" min="30" max="1000" step="10" />
+        </label>
+        <button class="btn small" id="btnKlineReload">重载</button>
+        <button class="btn small" id="btnDrawerClose">关闭</button>
+      </div>
+    </div>
+    <div class="drawer-body">
+      <div class="cpt-bar" id="drawerConcepts" hidden></div>
+      <div class="plan-bar" id="drawerPlanBar"></div>
+      <div id="klineChart" class="chart tall"></div>
+      <div class="drawer-foot" id="drawerFoot"></div>
+    </div>
+  </aside>
+
+  <div class="toast-wrap" id="toastWrap"></div>
+
+  <script src="/static/vendor/echarts.min.js"></script>
+  <script src="/static/app.js?v=__ASSET_VER__"></script>
+</body>
+</html>

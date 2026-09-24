@@ -1,0 +1,15 @@
+# 运行期数据（可按需保留，不入库）
+data/cache/
+data/stock_names.json
+data/industries.json
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/backups/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
