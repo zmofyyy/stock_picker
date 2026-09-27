@@ -538,6 +538,104 @@ label.inline input:focus { outline: none; border-color: var(--accent); }
 .stale-banner button:hover { background: rgba(0, 0, 0, .20); }
 
 /* ==========================================================================
+   板块看盘（概念板块 / 行业板块）
+   --------------------------------------------------------------------------
+   顶部一排类别 tab → 上半左右两栏列表 → 下半左右两张「K线 + 成交量 + MACD」，
+   照行情软件的看盘习惯：左看板块、右看成分股，下面各带一张图。
+   ========================================================================== */
+
+/* 类别 tab：macOS 分段控件样式——选中项不用满色块，靠半透明蓝底 + 描边区分，
+   避免和侧栏的整块 accent 选中态抢注意力。
+   外层 .bp-tabs-row 只负责「tab 组 + 右侧说明」横向排布，说明文字不进 tab 的框。 */
+.bp-tabs-row {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.bp-tabs {
+  display: flex; align-items: center; gap: 3px;
+  padding: 3px;
+  background: var(--deep); border: 1px solid var(--line);
+  border-radius: var(--radius); width: fit-content;
+}
+.bp-tab {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 16px; border: 1px solid transparent; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text-2); cursor: pointer;
+  font: inherit; font-size: 13px; white-space: nowrap;
+  transition: background-color var(--ease), color var(--ease), border-color var(--ease);
+}
+.bp-tab i {
+  width: 7px; height: 7px; border-radius: 50%; flex: none;
+  transition: background-color var(--ease);
+}
+.bp-tab[data-cat="概念"] i { background: #bf5af2; }
+.bp-tab[data-cat="行业"] i { background: #64d2ff; }
+.bp-tab:hover { background: rgba(255, 255, 255, .05); color: var(--text); }
+.bp-tab.active {
+  background: rgba(10, 132, 255, .14); border-color: rgba(10, 132, 255, .45);
+  color: var(--text); font-weight: 600;
+}
+.bp-tab b {
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  padding: 1px 6px; border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, .10); color: var(--text-2);
+  transition: background-color var(--ease), color var(--ease);
+}
+.bp-tab.active b { background: rgba(10, 132, 255, .34); color: #fff; }
+/* 目录还没加载回来时不要留一个空徽章 */
+.bp-tab b:empty { display: none; }
+.bp-tabs-note { font-size: 11px; color: var(--muted); }
+
+.bp-split {
+  display: grid;
+  /* minmax(0, …fr) 是关键：不加 minmax(0,·)，grid 子项会被表内容撑破，
+     两栏宽度就随内容跳变 */
+  grid-template-columns: minmax(0, 46fr) minmax(0, 54fr);
+  gap: 14px;
+}
+.bp-pane { padding: 12px 14px; margin-bottom: 14px; }
+.bp-pane .card-head { margin-bottom: 9px; }
+
+/* 表格区：固定高度内滚动，上下两半都能同时看见 */
+.bp-wrap {
+  overflow: auto; max-height: 42vh;
+  border: 1px solid var(--line); border-radius: var(--radius);
+}
+#bpBoardTable { min-width: 510px; }   /* 9 列（类别已由上方 tab 表达，不再占列） */
+#bpMemberTable { min-width: 860px; }
+#bpBoardTable th, #bpBoardTable td,
+#bpMemberTable th, #bpMemberTable td { padding: 5px 7px; }
+#bpBoardTable thead th.sortable,
+#bpMemberTable thead th.sortable { cursor: pointer; user-select: none; }
+#bpBoardTable thead th.sortable:hover,
+#bpMemberTable thead th.sortable:hover { color: var(--text); background: var(--mid); }
+#bpBoardTable thead th.sorted,
+#bpMemberTable thead th.sorted {
+  color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+/* 选中行：只用一条左侧色条 + 略亮的底，不做渐变 */
+tbody tr.sel { background: rgba(10, 132, 255, .14); }
+tbody tr.sel:hover { background: rgba(10, 132, 255, .20); }
+tbody tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+
+.bp-sub { color: var(--muted); font-size: 10.5px; }
+.bp-sep { color: var(--muted); margin: 0 2px; }
+.bp-strong { font-weight: 600; }
+
+/* 下半：两张三栏图并排 */
+.bp-charts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+.bp-charts .card { padding: 12px 14px; }
+.bp-charts .card-head { margin-bottom: 6px; }
+.bp-charts .chart { height: 420px; }
+
+/* 窄屏：两栏叠成一列（先看板块、再看成分股、最后两张图） */
+@media (max-width: 1400px) {
+  .bp-split, .bp-charts { grid-template-columns: minmax(0, 1fr); }
+  .bp-wrap { max-height: 46vh; }
+}
+
+/* ==========================================================================
    连板梯队
    ========================================================================== */
 

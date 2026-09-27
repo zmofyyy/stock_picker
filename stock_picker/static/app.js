@@ -59,6 +59,21 @@ const state = {
   intersect: null,          // 最近一次 /api/intersect 的完整返回
   ixRows: [],               // 交集明细（未排序）
   ixSort: { key: 'amount_yi', dir: 'desc' },
+
+  /* ---- 板块看盘（概念板块 / 行业板块） ---- */
+  bpCatalog: null,          // /api/board_catalog 的返回（类别清单）
+  bpCategory: '概念',        // 当前类别 tab（index.html 里两个 .bp-tab 的 data-cat 之一）
+  bpPanel: null,            // /api/board_panel 的返回
+  bpRows: [],               // 板块列表（未排序）
+  bpSort: { key: 'pct', dir: 'desc' },
+  bpBoard: null,            // 当前选中的板块（一行）
+  bpMembers: null,          // /api/board_members 的返回
+  bpMemberRows: [],
+  bpMemberSort: { key: 'pct', dir: 'desc' },
+  bpStock: null,            // 当前选中的成分股（一行）
+  bpIndexChart: null,       // 板块指数图（主图 + 量 + MACD）
+  bpStockChart: null,       // 个股图
+  bpLoaded: false,
 };
 
 /* 结果表可排序的列：get(r) 取排序值；type 决定比较方式与首次点击的方向 */
@@ -2110,6 +2125,417 @@ async function loadKline() {
 }
 
 /* ------------------------------------------------------------------ */
+/* 板块看盘（概念板块 / 行业板块）                                      */
+/* ------------------------------------------------------------------ */
+/* 板块列表可排序的列。默认按涨幅降序 —— 看盘第一眼看的就是「谁在涨」。
+   注意：没有 category 列 —— 类别已由上方 tab 选定，整列同值是噪音。 */
+const BOARD_SORT_COLS = {
+  code:       { type: 'text', get: (r) => r.index_code },
+  name:       { type: 'text', get: (r) => r.name || '' },
+  pct:        { type: 'num',  get: (r) => r.pct },
+  close:      { type: 'num',  get: (r) => r.close },
+  amount_yi:  { type: 'num',  get: (r) => r.amount_yi },
+  vol_ratio:  { type: 'num',  get: (r) => r.vol_ratio },
+  turnover:   { type: 'num',  get: (r) => r.turnover },
+  n_up:       { type: 'num',  get: (r) => r.n_up },
+  n_down:     { type: 'num',  get: (r) => r.n_down },
+  n_limit_up: { type: 'num',  get: (r) => r.n_limit_up },
+  avg_pct:    { type: 'num',  get: (r) => r.avg_pct },
+  n_members:  { type: 'num',  get: (r) => r.n_members },
+};
+
+/* 成分股表可排序的列 */
+const BP_MEMBER_SORT_COLS = {
+  code:          { type: 'text', get: (r) => r.symbol || r.code },
+  name:          { type: 'text', get: (r) => r.name || '' },
+  industry_l2:   { type: 'text', get: (r) => r.industry_l2 || '' },
+  pct:           { type: 'num',  get: (r) => r.pct },
+  close:         { type: 'num',  get: (r) => r.close },
+  amount_yi:     { type: 'num',  get: (r) => r.amount_yi },
+  vol_ratio:     { type: 'num',  get: (r) => r.vol_ratio },
+  turnover:      { type: 'num',  get: (r) => r.turnover },
+  volume_hand:   { type: 'num',  get: (r) => r.volume_hand },
+  float_mcap_yi: { type: 'num',  get: (r) => r.float_mcap_yi },
+  concept_n:     { type: 'num',  get: (r) => r.concept_n },
+  board:         { type: 'text', get: (r) => r.board || '' },
+  limit:         { type: 'text', get: (r) => r.limit || '' },
+};
+
+/* 「板块类别」在主视图只保留概念板块与行业板块两类（2026-09-26 用户要求）：
+   地区板块本地没有成分文件（只有指数行情），风格板块是因子/盘口指标而非题材，
+   两类都不适合做题材看盘。tab 写死在 index.html，这里只按目录补数量。 */
+const BP_CATEGORY_LABEL = { 概念: '概念板块', 行业: '行业板块', 地区: '地区板块', 风格: '风格板块' };
+
+function bpTabButtons() {
+  return [...document.querySelectorAll('#bpTabs .bp-tab[data-cat]')];
+}
+
+/* 切类别 tab：只改选中态，取数由调用方决定（loadBoardPanel） */
+function setBoardCategory(cat) {
+  state.bpCategory = cat;
+  bpTabButtons().forEach((b) => {
+    const on = b.dataset.cat === cat;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+}
+
+async function loadBoardCatalog() {
+  const d = await api('/api/board_catalog');
+  state.bpCatalog = d;
+  // 数量取「有成分」的那个数：与「仅有成分」勾选（默认开）下的行数一致。
+  // 用板块总数会对不上（概念 269/268、行业 145/132），tab 上的数字必须等于点了之后的行数。
+  const byCat = Object.fromEntries((d.categories || []).map((c) => [c.value, c]));
+  bpTabButtons().forEach((b) => {
+    const c = byCat[b.dataset.cat];
+    const n = c ? (c.n_members ?? c.n) : null;
+    b.querySelector('b').textContent = n === null ? '' : String(n);
+  });
+  setBoardCategory(state.bpCategory);
+  return d;
+}
+
+async function loadBoardPanel() {
+  const q = new URLSearchParams();
+  const date = $('#bpDate').value;
+  if (date) q.set('date', date);
+  if (state.bpCategory) q.set('category', state.bpCategory);
+  // 后端只负责给「cfg 顺序」的全量，排序由表头在前端做（604 行，即时响应）
+  q.set('sort', 'order');
+  q.set('order', 'asc');
+  q.set('limit', '0');
+  q.set('with_members_only', $('#bpOnlyMembers').checked ? 'true' : 'false');
+  const kw = $('#bpSearch').value.trim();
+  if (kw) q.set('keyword', kw);
+
+  let d;
+  try {
+    d = await api('/api/board_panel?' + q.toString());
+  } catch (e) { toast('加载板块失败：' + e.message, 'err'); return; }
+  if (!d.ok) { toast(d.reason || '加载失败', 'err'); return; }
+
+  state.bpPanel = d;
+  state.bpRows = d.rows || [];
+  renderBoardConditions(d);
+  renderBoardTable();
+  // 数据整体换了（切类别 / 换日期 / 改筛选），旧的选中板块可能已经不在列表里
+  if (state.bpBoard && !state.bpRows.some((r) => r.index_code === state.bpBoard.index_code)) {
+    clearBoardPicks();
+  }
+}
+
+/* 选中板块失效时把右下三处一起复位。
+   只清 state.bpBoard 不清图，会出现「左上已是行业板块、右下还挂着概念板块的 K 线」 */
+function clearBoardPicks() {
+  state.bpBoard = null;
+  state.bpMembers = null;
+  state.bpMemberRows = [];
+  state.bpStock = null;
+  renderBoardMembers();
+  if (state.bpIndexChart) state.bpIndexChart.clear();
+  if (state.bpStockChart) state.bpStockChart.clear();
+  $('#bpIndexTitle').textContent = '板块指数 K 线';
+  $('#bpIndexMeta').textContent = '先在上面选一个板块';
+  $('#bpStockTitle').textContent = '个股 K 线';
+  $('#bpStockMeta').textContent = '再点一只成分股';
+}
+
+function renderBoardConditions(d) {
+  const s = d.summary || {};
+  const catLabel = BP_CATEGORY_LABEL[d.category] || d.category || '全部';
+  const items = [
+    `交易日 <b>${esc(d.date)}</b>（本地缓存最新交易日）`,
+    `板块类别 <b>${esc(catLabel)}</b> · 命中 <b>${d.total}</b> 个`,
+    `板块指数涨跌：<b>${s.boards_up ?? 0}</b> 涨 / <b>${s.boards_down ?? 0}</b> 跌`
+      + (s.boards_flat ? ` / ${s.boards_flat} 平` : '')
+      + (s.boards_no_quote ? ` / ${s.boards_no_quote} 当日无行情` : ''),
+    `全市场 <b>${s.stocks_quoted ?? 0}</b> 只有行情：涨停 <b>${s.limit_up_stocks ?? 0}</b> 只 / `
+      + `跌停 <b>${s.limit_down_stocks ?? 0}</b> 只（去重口径，与连板梯队一致）`,
+    '成分统计口径：涨停按「前收 × 涨跌幅限制」用整数分判定；换手 = Σ成交量 ÷ Σ流通股本',
+    '概念板块来自 GN_ 成分文件，行业板块按通达信 T 码归属聚合；同一只股票可属多个概念',
+  ];
+  $('#boardConditions').innerHTML = items.map((t) => `<li>${t}</li>`).join('');
+}
+
+function bpPctCell(v, digits = 2) {
+  return `<td class="num ${pctClass(v)}">${v === null || v === undefined ? '-' : fmtPct(v, digits)}</td>`;
+}
+
+function renderBoardTable() {
+  const tb = $('#bpBoardTable tbody');
+  const rows = state.bpRows;
+  const total = state.bpPanel ? state.bpPanel.total : rows.length;
+  $('#bpBoardMeta').textContent = rows.length
+    ? `${rows.length} 个板块${rows.length < total ? `（全部 ${total}）` : ''}`
+    : '';
+
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="9" class="empty">暂无板块数据，点「加载板块」</td></tr>';
+    return;
+  }
+  const idx = orderBy(rows, state.bpSort, BOARD_SORT_COLS);
+  tb.innerHTML = idx.map((i) => {
+    const r = rows[i];
+    const sel = state.bpBoard && state.bpBoard.index_code === r.index_code ? ' sel' : '';
+    const nm = r.n_quoted !== null && r.n_quoted !== undefined && r.n_quoted !== r.n_members
+      ? `${r.n_members}<span class="bp-sub">/${r.n_quoted}</span>`
+      : `${r.n_members ?? '-'}`;
+    const noM = r.n_up === null || r.n_up === undefined;
+    return `<tr class="clickable${sel}" data-code="${esc(r.index_code)}"
+                title="${esc(r.name)} · 成分 ${r.n_members ?? 0} 只，当日有行情 ${r.n_quoted ?? 0} 只">
+      <td class="code">${esc(r.index_code)}</td>
+      <td>${esc(r.name)}</td>
+      ${bpPctCell(r.pct)}
+      <td class="num">${fmt(r.amount_yi, 2)}</td>
+      <td class="num">${fmt(r.vol_ratio, 2)}</td>
+      ${bpPctCell(r.turnover)}
+      <td class="num">${noM ? '-' : `<span class="up">${r.n_up}</span><span class="bp-sep">/</span><span class="down">${r.n_down}</span>`}</td>
+      <td class="num ${r.n_limit_up ? 'up bp-strong' : ''}">${noM ? '-' : (r.n_limit_up || 0)}</td>
+      <td class="num">${nm}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function selectBoard(row) {
+  state.bpBoard = row;
+  renderBoardTable();
+  await Promise.all([loadBoardMembers(row.index_code), loadBoardIndexKline(row)]);
+}
+
+async function loadBoardMembers(code) {
+  const q = new URLSearchParams({ board: code, sort: 'pct', order: 'desc', limit: '0' });
+  const date = $('#bpDate').value;
+  if (date) q.set('date', date);
+  let d;
+  try {
+    d = await api('/api/board_members?' + q.toString());
+  } catch (e) { toast('加载成分股失败：' + e.message, 'err'); return; }
+  if (!d.ok) { toast(d.reason || '加载成分股失败', 'err'); return; }
+  state.bpMembers = d;
+  state.bpMemberRows = d.rows || [];
+  renderBoardMembers();
+}
+
+function renderBoardMembers() {
+  const tb = $('#bpMemberTable tbody');
+  const rows = state.bpMemberRows;
+  const head = state.bpMembers;
+  const meta = $('#bpMemberMeta');
+  if (!head || !state.bpBoard) {
+    meta.textContent = '';
+    $('#bpMemberHint').textContent = '点一行：出个股 K 线';
+    tb.innerHTML = '<tr><td colspan="13" class="empty">在左边点一个板块</td></tr>';
+    return;
+  }
+  const b = head.board || {};
+  meta.textContent = rows.length
+    ? `${b.name}（${b.category}）· ${rows.length} 只有行情`
+      + (head.n_suspended ? ` · 停牌 ${head.n_suspended}` : '')
+      + (head.n_limit_up ? ` · 涨停 ${head.n_limit_up}` : '')
+    : '';
+  $('#bpMemberHint').textContent = head.reason
+    ? head.reason
+    : `点一行：出个股 K 线（${esc(head.date)}）`;
+
+  if (!rows.length) {
+    tb.innerHTML = `<tr><td colspan="13" class="empty">${esc(head.reason || '该板块当日没有成分股行情')}</td></tr>`;
+    return;
+  }
+  const idx = orderBy(rows, state.bpMemberSort, BP_MEMBER_SORT_COLS);
+  tb.innerHTML = idx.map((i) => {
+    const r = rows[i];
+    const tag = r.limit === '涨停'
+      ? '<span class="tag buy">涨停</span>'
+      : (r.limit === '跌停' ? '<span class="tag ok">跌停</span>' : '');
+    const sel = state.bpStock && state.bpStock.code === r.code ? ' sel' : '';
+    return `<tr class="clickable${sel}" data-code="${esc(r.code)}">
+      <td class="code">${esc(r.symbol || r.code)}</td>
+      <td>${esc(r.name || '')}</td>
+      <td>${r.industry_l2 ? `<span class="ind">${esc(r.industry_l2)}</span>` : '<span class="muted">-</span>'}</td>
+      ${bpPctCell(r.pct)}
+      <td class="num">${fmt(r.close, 2)}</td>
+      <td class="num">${fmt(r.amount_yi, 2)}</td>
+      <td class="num">${fmt(r.vol_ratio, 2)}</td>
+      ${bpPctCell(r.turnover)}
+      <td class="num">${fmtWan(r.volume_hand)}</td>
+      <td class="num">${fmt(r.float_mcap_yi, 1)}</td>
+      <td class="num">${r.concept_n ?? '-'}</td>
+      <td><span class="tag">${esc(r.board || '')}</span></td>
+      <td>${tag}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* ---- K 线：主图 + 成交量 + MACD 三栏（板块指数与个股同一套渲染） ---- */
+function bpChartOption(d, bars) {
+  const volColors = d.ohlc.map((o) => (o[1] >= o[0] ? UP : DOWN));
+  const macd = d.macd || { dif: [], dea: [], macd: [] };
+  const macdBars = (macd.macd || []).map((v) => ({
+    value: v,
+    itemStyle: { color: Number(v) >= 0 ? UP : DOWN },
+  }));
+  const baseGrid = { left: 56, right: 20 };
+  const axisCommon = {
+    type: 'category', boundaryGap: true, min: 'dataMin', max: 'dataMax',
+    splitLine: { show: false },
+  };
+  return {
+    animation: false,
+    backgroundColor: 'transparent',
+    textStyle: { color: C.text2, fontSize: 11 },
+    legend: {
+      top: 2, left: 8, itemGap: 12, itemWidth: 14, itemHeight: 8,
+      textStyle: { color: C.muted, fontSize: 11 }, inactiveColor: '#48484a',
+      data: ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '成交量', '20日均量', 'MACD', 'DIF', 'DEA'],
+    },
+    tooltip: {
+      trigger: 'axis', axisPointer: { type: 'cross' },
+      backgroundColor: C.glass, borderColor: C.line,
+      extraCssText: 'backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);',
+      textStyle: { color: C.text, fontSize: 12 },
+      formatter: (ps) => {
+        const i = ps[0].dataIndex;
+        const h = d.ohlc[i];
+        if (!h) return '';
+        const prev = i > 0 ? d.ohlc[i - 1][1] : h[0];
+        const chg = prev ? (h[1] / prev - 1) * 100 : 0;
+        const c = chg >= 0 ? UP : DOWN;
+        const dif = macd.dif[i];
+        const dea = macd.dea[i];
+        return `<b>${d.dates[i]}</b><br/>开 ${fmt(h[0])}　高 ${fmt(h[3])}<br/>`
+          + `低 ${fmt(h[2])}　收 <b style="color:${c}">${fmt(h[1])}</b>　`
+          + `涨跌 <span style="color:${c}">${chg.toFixed(2)}%</span><br/>`
+          + `量 ${fmtInt(d.volume[i])} 手　量比 <b>${fmt(d.vol_ratio[i], 2)}×</b><br/>`
+          + `MACD DIF ${fmt(dif, 3)}　DEA ${fmt(dea, 3)}`;
+      },
+    },
+    axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    grid: [
+      { ...baseGrid, top: 26, height: 186 },
+      { ...baseGrid, top: 224, height: 68 },
+      { ...baseGrid, top: 304, height: 68 },
+    ],
+    xAxis: [0, 1, 2].map((g) =>
+      g === 2
+        ? { ...axisCommon, gridIndex: g, data: d.dates,
+            axisLine: { lineStyle: { color: C.line } },
+            axisLabel: { color: C.muted, formatter: (v) => String(v).slice(5) } }
+        : { ...axisCommon, gridIndex: g, data: d.dates,
+            axisLine: { lineStyle: { color: C.line } }, axisLabel: { show: false } }
+    ),
+    yAxis: [
+      { scale: true, gridIndex: 0, splitLine: { lineStyle: { color: C.grid } },
+        axisLabel: { color: C.muted }, axisLine: { show: false } },
+      { gridIndex: 1, splitLine: { show: false }, axisLine: { show: false },
+        axisTick: { show: false }, axisLabel: { color: C.muted, showMaxLabel: false } },
+      { scale: true, gridIndex: 2, splitLine: { show: false }, axisLine: { show: false },
+        axisTick: { show: false }, axisLabel: { color: C.muted, showMaxLabel: false } },
+    ],
+    dataZoom: [
+      { type: 'inside', xAxisIndex: [0, 1, 2], start: 55, end: 100 },
+      { type: 'slider', xAxisIndex: [0, 1, 2], bottom: 6, height: 14,
+        start: 55, end: 100, borderColor: C.line,
+        fillerColor: 'rgba(10,132,255,.16)',
+        handleStyle: { color: C.accent }, moveHandleStyle: { color: C.accent },
+        dataBackground: { lineStyle: { color: C.line }, areaStyle: { color: C.grid } } },
+    ],
+    series: [
+      {
+        name: 'K线', type: 'candlestick', data: d.ohlc, xAxisIndex: 0, yAxisIndex: 0,
+        itemStyle: { color: UP, color0: DOWN, borderColor: UP, borderColor0: DOWN },
+      },
+      { name: 'MA5', type: 'line', data: d.ma.ma5, xAxisIndex: 0, yAxisIndex: 0, showSymbol: false, lineStyle: { width: 1, color: C.ma5 }, itemStyle: { color: C.ma5 } },
+      { name: 'MA10', type: 'line', data: d.ma.ma10, xAxisIndex: 0, yAxisIndex: 0, showSymbol: false, lineStyle: { width: 1, color: C.ma10 }, itemStyle: { color: C.ma10 } },
+      { name: 'MA20', type: 'line', data: d.ma.ma20, xAxisIndex: 0, yAxisIndex: 0, showSymbol: false, lineStyle: { width: 1.4, color: C.ma20 }, itemStyle: { color: C.ma20 } },
+      { name: 'MA60', type: 'line', data: d.ma.ma60, xAxisIndex: 0, yAxisIndex: 0, showSymbol: false, lineStyle: { width: 1, color: C.ma60 }, itemStyle: { color: C.ma60 } },
+      { name: '成交量', type: 'bar', data: d.volume, xAxisIndex: 1, yAxisIndex: 1,
+        itemStyle: { color: (p) => volColors[p.dataIndex] } },
+      { name: '20日均量', type: 'line', data: d.volume_ma, xAxisIndex: 1, yAxisIndex: 1,
+        showSymbol: false, lineStyle: { width: 1.2, color: C.volma }, itemStyle: { color: C.volma } },
+      { name: 'MACD', type: 'bar', data: macdBars, xAxisIndex: 2, yAxisIndex: 2 },
+      { name: 'DIF', type: 'line', data: macd.dif, xAxisIndex: 2, yAxisIndex: 2,
+        showSymbol: false, lineStyle: { width: 1, color: C.ma5 }, itemStyle: { color: C.ma5 } },
+      { name: 'DEA', type: 'line', data: macd.dea, xAxisIndex: 2, yAxisIndex: 2,
+        showSymbol: false, lineStyle: { width: 1, color: C.volma }, itemStyle: { color: C.volma } },
+    ],
+  };
+}
+
+async function loadBoardIndexKline(row) {
+  const bars = 160;
+  let d;
+  try {
+    d = await api(`/api/board_kline/${encodeURIComponent(row.index_code)}?bars=${bars}`);
+  } catch (e) { toast('加载板块指数 K 线失败：' + e.message, 'err'); return; }
+  if (!d.ok) { toast(d.reason || '加载失败', 'err'); return; }
+  $('#bpIndexTitle').textContent = `${d.code} ${d.name} · 板块指数 K 线`;
+  $('#bpIndexMeta').textContent =
+    `${d.category} · 成分 ${d.n_members} 只 · ${d.bars} 根 · 最新 ${d.latest.date} 收 ${fmt(d.latest.close, 2)}`;
+  if (!state.bpIndexChart) state.bpIndexChart = echarts.init($('#bpIndexChart'));
+  state.bpIndexChart.setOption(bpChartOption(d, bars), true);
+  state.bpIndexChart.resize();
+}
+
+async function loadBoardStockKline(row) {
+  $('#bpStockTitle').textContent = `${row.code} ${row.name || ''} · K 线`;
+  let d;
+  try {
+    d = await api(`/api/kline/${encodeURIComponent(row.code)}?bars=160&ma_window=20`);
+  } catch (e) { toast('加载个股 K 线失败：' + e.message, 'err'); return; }
+  if (!d.ok) { toast(d.reason || '加载失败', 'err'); return; }
+  $('#bpStockMeta').textContent =
+    `${row.industry_l2 || '未分类'} · ${d.bars} 根 · 最新 ${d.latest.date} 收 ${fmt(d.latest.close, 2)}`;
+  if (!state.bpStockChart) state.bpStockChart = echarts.init($('#bpStockChart'));
+  state.bpStockChart.setOption(bpChartOption(d, 160), true);
+  state.bpStockChart.resize();
+}
+
+function bindBoard() {
+  $('#btnBoardLoad').onclick = loadBoardPanel;
+  // 类别 tab：点已选中的那个不重复请求
+  $('#bpTabs').addEventListener('click', (ev) => {
+    const b = ev.target.closest('.bp-tab[data-cat]');
+    if (!b || b.dataset.cat === state.bpCategory) return;
+    setBoardCategory(b.dataset.cat);
+    clearBoardPicks();          // 换类别＝整个板块池都换了，右下的残留先清掉
+    loadBoardPanel();
+  });
+  $('#bpOnlyMembers').onchange = loadBoardPanel;
+  $('#bpSearch').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); loadBoardPanel(); }
+  });
+  $('#bpDate').onchange = (e) => { snapTradeDate(e.target, { notify: true }); loadBoardPanel(); };
+  $('#bpDateLatest').onclick = () => { $('#bpDate').value = ''; loadBoardPanel(); };
+
+  bindSortHead('#bpBoardTable', state.bpSort, BOARD_SORT_COLS, () => {
+    paintSortHeaders('#bpBoardTable', state.bpSort);
+    renderBoardTable();
+  });
+  bindSortHead('#bpMemberTable', state.bpMemberSort, BP_MEMBER_SORT_COLS, () => {
+    paintSortHeaders('#bpMemberTable', state.bpMemberSort);
+    renderBoardMembers();
+  });
+  paintSortHeaders('#bpBoardTable', state.bpSort);
+  paintSortHeaders('#bpMemberTable', state.bpMemberSort);
+
+  $('#bpBoardTable').addEventListener('click', (ev) => {
+    const tr = ev.target.closest('tr[data-code]');
+    if (!tr) return;
+    const row = state.bpRows.find((r) => r.index_code === tr.dataset.code);
+    if (row) selectBoard(row);
+  });
+  $('#bpMemberTable').addEventListener('click', (ev) => {
+    const tr = ev.target.closest('tr[data-code]');
+    if (!tr) return;
+    const row = state.bpMemberRows.find((r) => r.code === tr.dataset.code);
+    if (!row) return;
+    state.bpStock = row;
+    renderBoardMembers();
+    loadBoardStockKline(row);
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* 初始化                                                              */
 /* ------------------------------------------------------------------ */
 const VIEW_META = {
@@ -2124,6 +2550,10 @@ const VIEW_META = {
   intersect: {
     title: '板块交集',
     sub: '二级行业 ∩ 概念 = 同时属于两侧的个股 · 左侧行业多选（并集）· 右侧概念可任一/全部 · 点行看 K 线',
+  },
+  board: {
+    title: '板块看盘',
+    sub: '顶部 tab 切「概念板块 / 行业板块」（本地有成分的两类，来源于通达信板块指数表）· 涨幅 / 成交额 / 量比 / 成分涨跌家数 · 上下两栏联动，左看板块右看成分股',
   },
   plan: {
     title: '计划',
@@ -2145,6 +2575,18 @@ function switchTab(name) {
   }
   if (name === 'plan') loadPlans();
   if (name === 'watch') loadWatch();
+  // 板块看盘：首次切过去时加载（ECharts 必须在面板可见后再 init，否则宽度为 0）
+  if (name === 'board') {
+    if (!state.bpLoaded) {
+      state.bpLoaded = true;
+      loadBoardCatalog().then(loadBoardPanel).catch((e) => toast('加载板块失败：' + e.message, 'err'));
+    } else {
+      setTimeout(() => {
+        if (state.bpIndexChart) state.bpIndexChart.resize();
+        if (state.bpStockChart) state.bpStockChart.resize();
+      }, 80);
+    }
+  }
   // 连板梯队：首次切过去时加载；已有数据就只是把图重新量一次尺寸
   if (name === 'streak') {
     if (!state.streak) loadStreaks();
@@ -2221,9 +2663,13 @@ async function init() {
   $('#fDate').onchange = (e) => snapTradeDate(e.target, { notify: true });
   $('#fDateLatest').onclick = () => { $('#fDate').value = ''; };
   $('#staleReload').onclick = () => location.reload();
+  // ---- 板块看盘 ----
+  bindBoard();
   window.addEventListener('resize', () => {
     if (state.klineChart) state.klineChart.resize();
     if (state.streakChart) state.streakChart.resize();
+    if (state.bpIndexChart) state.bpIndexChart.resize();
+    if (state.bpStockChart) state.bpStockChart.resize();
   });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
 

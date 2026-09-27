@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stock_picker · 项目导读</title>
+<style>
+  :root{
+    --bg:#f5f5f7; --card:#ffffff; --ink:#1c1c1e; --ink2:#3a3a3c; --ink3:#6e6e73;
+    --line:#e3e3e6; --line2:#ededf0;
+    --up:#d70015; --down:#00875a; --accent:#0b63ce; --accent-soft:#eef4fd;
+    --warn:#b25000; --warn-soft:#fff5e8;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 24px 72px}
+  header.top{margin-bottom:28px}
+  .kicker{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3);font-weight:600}
+  h1{font-family:Georgia,"Songti SC","SimSun",serif;font-weight:600;font-size:32px;margin:10px 0 6px;letter-spacing:.01em}
+  .sub{color:var(--ink2);font-size:15px;max-width:76ch}
+  .meta{margin-top:14px;display:flex;flex-wrap:wrap;gap:8px}
+  .chip{font-size:12px;color:var(--ink3);background:#fff;border:1px solid var(--line);border-radius:999px;padding:4px 11px}
+  h2{font-family:Georgia,"Songti SC",serif;font-size:22px;font-weight:600;margin:44px 0 14px;
+     padding-bottom:9px;border-bottom:1px solid var(--line)}
+  h3{font-size:15.5px;font-weight:650;margin:26px 0 10px}
+  p{margin:10px 0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:16px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.grid2{grid-template-columns:1fr}}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px;background:#fff;
+    border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--line2);vertical-align:top}
+  th{background:#fafafc;font-weight:650;color:var(--ink2);white-space:nowrap;font-size:13px}
+  tr:last-child td{border-bottom:none}
+  td code,p code,li code{font-family:var(--mono);font-size:12.5px;background:#f2f2f5;border-radius:5px;padding:1.5px 5px;color:#24292f}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px}
+  ul,ol{margin:10px 0;padding-left:22px}
+  li{margin:5px 0}
+  .up{color:var(--up);font-weight:600}
+  .down{color:var(--down);font-weight:600}
+  .note{border-left:3px solid var(--accent);background:var(--accent-soft);border-radius:0 10px 10px 0;padding:12px 16px;margin:14px 0;font-size:14px}
+  .danger{border-left:3px solid var(--warn);background:var(--warn-soft);border-radius:0 10px 10px 0;padding:12px 16px;margin:14px 0;font-size:14px}
+  .note b,.danger b{color:var(--ink)}
+  .tabs{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:16px 0}
+  .tab{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .tab .t{font-weight:650;font-size:14px;margin-bottom:4px}
+  .tab .d{font-size:12.5px;color:var(--ink3);line-height:1.6}
+  .tab .api{font-family:var(--mono);font-size:11.5px;color:var(--accent);margin-top:7px;word-break:break-all}
+  .flow{background:#fff;border:1px solid var(--line);border-radius:14px;padding:10px 6px;margin:16px 0}
+  .strike{text-decoration:line-through;color:var(--ink3)}
+  footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--line);color:var(--ink3);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div class="kicker">Project Study · 2026-09-24</div>
+  <h1>stock_picker 项目导读</h1>
+  <div class="sub">
+    一句话：<b>用本地通达信的日线数据，离线筛出「今天放量」的主板股票，给出买卖价并持续追踪</b>。
+    全部计算在本机完成，不联网、不需要接口额度；后端 FastAPI，前端原生 JS 单页，无构建步骤。
+  </div>
+  <div class="meta">
+    <span class="chip">工作区 E:\sourcecode\stock_picker</span>
+    <span class="chip">源码态端口 8771</span>
+    <span class="chip">后端 ~3 800 行 Python</span>
+    <span class="chip">前端 ~3 400 行无框架 JS</span>
+    <span class="chip">数据源 D:\new_tdx</span>
+  </div>
+</header>
+
+<h2>1. 五个页签各解决什么问题</h2>
+<p>四张表、一个问题一张，互相之间只共享「行情 + 行业 + 概念」这三份索引，不共享筛选状态。</p>
+<div class="tabs">
+  <div class="tab"><div class="t">选股</div><div class="d">成交量 ≥ N 倍前 M 日均量；默认只扫主板；结果带二级行业与概念</div><div class="api">POST /api/screen</div></div>
+  <div class="tab"><div class="t">连板梯队</div><div class="d">某交易日的涨停股按连板高度分层，含封板形态、晋级率、行业/概念分布</div><div class="api">GET /api/streaks</div></div>
+  <div class="tab"><div class="t">板块交集</div><div class="d">二级行业 ∩ 概念的集合运算，纯归属、与量价无关；空交集会给调整建议</div><div class="api">GET /api/intersect</div></div>
+  <div class="tab"><div class="t">计划</div><div class="d">买入价/卖出价/数量/状态，由选股结果落库</div><div class="api">/api/plans</div></div>
+  <div class="tab"><div class="t">追踪</div><div class="d">计划 + 实际买入，自动算是否触及买入价、是否达卖出价、收益率</div><div class="api">/api/watchlist</div></div>
+</div>
+
+<h2>2. 代码地图</h2>
+<table>
+  <tr><th>文件</th><th>行数</th><th>职责</th><th>关键入口</th></tr>
+  <tr><td><code>app.py</code></td><td class="num">810</td><td>FastAPI 应用、全部 REST 路由、CLI 入口、启动预加载线程、资源指纹中间件</td><td><code>_startup_preload()</code> · <code>_asset_version()</code></td></tr>
+  <tr><td><code>service.py</code></td><td class="num">1998</td><td>业务核心：行情缓存、选股、连板、交集、K 线、估值</td><td><code>screen()</code> <code>streaks()</code> <code>intersect()</code> <code>preload()</code></td></tr>
+  <tr><td><code>tdx_reader.py</code></td><td class="num">519</td><td><code>.day</code> 读取层（向量化 / pytdx 两条路）、代码归一化、板块判定、缓存 dtype</td><td><code>read_day_fast()</code> <code>board_of()</code> <code>CACHE_DTYPES</code></td></tr>
+  <tr><td><code>limits.py</code></td><td class="num">214</td><td>涨跌停判定：涨跌幅因子、涨停价（整数分）、封板形态、连板长度</td><td><code>limit_masks()</code> <code>seal_shape()</code></td></tr>
+  <tr><td><code>names.py</code></td><td class="num">200</td><td><code>*.tnf</code> 名称表解析与索引缓存</td><td><code>build_index()</code></td></tr>
+  <tr><td><code>industry.py</code></td><td class="num">321</td><td><code>tdxhy.cfg</code> + <code>incon.dat</code> 的一/二/三级行业索引</td><td><code>Industries</code></td></tr>
+  <tr><td><code>concepts.py</code></td><td class="num">517</td><td>概念板块索引（269 个概念 + 成分股），两个源文件互证</td><td><code>Concepts</code></td></tr>
+  <tr><td><code>shares.py</code></td><td class="num">247</td><td>解析加密二进制 <code>gbbq</code>，取每只「最近一次股本变化」后的流通股本 → 流通市值</td><td><code>FloatShares</code></td></tr>
+  <tr><td><code>store.py</code></td><td class="num">357</td><td>计划/追踪的 SQLite 持久化（WAL + 在线快照备份）</td><td><code>Store</code></td></tr>
+  <tr><td><code>config.py</code></td><td class="num">125</td><td>目录解析（<code>RESOURCE_DIR</code> 只读 / <code>APP_DIR</code> 可写）与 JSON 配置合并</td><td><code>Config</code> <code>APP_DIR</code></td></tr>
+  <tr><td><code>static/</code></td><td class="num">3440</td><td><code>index.html</code> + <code>app.js</code> + <code>style.css</code> + 本地 ECharts（无 CDN）</td><td><code>switchTab()</code> <code>doScreen()</code></td></tr>
+  <tr><td><code>packaging/</code></td><td class="num">~2 400</td><td>PyInstaller 构建 + 5 个独立回归脚本（冒烟 109 项 / 连板 64 / 交集 88 / 分布卡 43 / 持久化）</td><td><code>build.py</code> <code>smoke_test.py</code></td></tr>
+</table>
+
+<h2>3. 数据流水线</h2>
+<p>整条链是「一次读盘、常驻内存、按日切片」的形态：本地文件只在启动时读一次，之后的选股/连板/交集都在这份内存长表上做向量化切片。</p>
+<div class="flow">
+<svg viewBox="0 0 1000 340" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,PingFang SC,Microsoft YaHei,sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 z" fill="#9a9aa2"/>
+    </marker>
+  </defs>
+  <!-- row labels -->
+  <text x="0" y="18" font-size="11" fill="#98989d" letter-spacing="1.4">本地只读文件</text>
+  <line x1="0" y1="26" x2="1000" y2="26" stroke="#ededf0"/>
+  <text x="0" y="176" font-size="11" fill="#98989d" letter-spacing="1.4">内存 / 缓存</text>
+  <line x1="0" y1="184" x2="1000" y2="184" stroke="#ededf0"/>
+  <text x="0" y="322" font-size="11" fill="#98989d" letter-spacing="1.4">对外</text>
+  <line x1="0" y1="290" x2="1000" y2="290" stroke="#ededf0"/>
+
+  <!-- sources -->
+  <rect x="6" y="40" width="176" height="52" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="94" y="60" font-size="12.5" font-weight="600" fill="#1c1c1e" text-anchor="middle">vipdoc/*/lday/*.day</text>
+  <text x="94" y="78" font-size="11" fill="#6e6e73" text-anchor="middle">9 755 个 · 全市场日线</text>
+
+  <rect x="6" y="102" width="176" height="52" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="94" y="122" font-size="12.5" font-weight="600" fill="#1c1c1e" text-anchor="middle">hq_cache/*.tnf</text>
+  <text x="94" y="140" font-size="11" fill="#6e6e73" text-anchor="middle">名称表 52 163 条</text>
+
+  <rect x="206" y="40" width="176" height="52" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="294" y="60" font-size="12.5" font-weight="600" fill="#1c1c1e" text-anchor="middle">tdxhy.cfg + incon.dat</text>
+  <text x="294" y="78" font-size="11" fill="#6e6e73" text-anchor="middle">行业 5 584 只 / 128 二级</text>
+
+  <rect x="206" y="102" width="176" height="52" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="294" y="122" font-size="12.5" font-weight="600" fill="#1c1c1e" text-anchor="middle">block.dat + tdxzs.cfg</text>
+  <text x="294" y="140" font-size="11" fill="#6e6e73" text-anchor="middle">概念 269 个 / 46 586 归属</text>
+
+  <rect x="406" y="40" width="176" height="52" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="494" y="60" font-size="12.5" font-weight="600" fill="#1c1c1e" text-anchor="middle">hq_cache/gbbq</text>
+  <text x="494" y="78" font-size="11" fill="#6e6e73" text-anchor="middle">流通股本 5 922 只（加密二进制）</text>
+
+  <rect x="406" y="102" width="176" height="52" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="494" y="122" font-size="12.5" font-weight="600" fill="#1c1c1e" text-anchor="middle">config.json</text>
+  <text x="494" y="140" font-size="11" fill="#6e6e73" text-anchor="middle">cache_bars / screen / bootstrap</text>
+
+  <!-- arrows to cache layer -->
+  <path d="M94,156 L94,196" stroke="#9a9aa2" stroke-width="1.2" marker-end="url(#ar)"/>
+  <path d="M294,156 L294,196" stroke="#9a9aa2" stroke-width="1.2" marker-end="url(#ar)"/>
+  <path d="M494,156 L494,196" stroke="#9a9aa2" stroke-width="1.2" marker-end="url(#ar)"/>
+  <path d="M94,92 L94,196" stroke="#9a9aa2" stroke-width="1.2" fill="none" opacity="0"/>
+
+  <!-- cache layer -->
+  <rect x="6" y="198" width="732" height="76" rx="11" fill="#f4f8ff" stroke="#c9dcf7"/>
+  <text x="24" y="222" font-size="13" font-weight="600" fill="#0b63ce">bars.parquet 344 MB · 16 202 033 行 · 5 608 只（重建 18.8 s，启动时自动判新旧）</text>
+  <text x="24" y="244" font-size="11.5" fill="#3a3a3c">dtype 收缩：code→category、date→int32、价格/amount/pct→float32、volume→uint32（必须）</text>
+  <text x="24" y="262" font-size="11.5" fill="#3a3a3c">不落列、按需算：bar_total / ma_vol / vol_ratio；索引：名称 · 行业 · 概念 · 流通股本 · 交易日</text>
+
+  <!-- arrows to API layer -->
+  <path d="M186,274 L186,300" stroke="#9a9aa2" stroke-width="1.2" marker-end="url(#ar)"/>
+  <path d="M556,274 L556,300" stroke="#9a9aa2" stroke-width="1.2" marker-end="url(#ar)"/>
+
+  <!-- api boxes -->
+  <rect x="6" y="300" width="176" height="34" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="94" y="322" font-size="12" fill="#1c1c1e" text-anchor="middle">POST /api/screen（0.18 s）</text>
+
+  <rect x="206" y="300" width="176" height="34" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="294" y="322" font-size="12" fill="#1c1c1e" text-anchor="middle">GET /api/streaks（0.08 s）</text>
+
+  <rect x="406" y="300" width="176" height="34" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="494" y="322" font-size="12" fill="#1c1c1e" text-anchor="middle">GET /api/intersect</text>
+
+  <rect x="624" y="300" width="176" height="34" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="712" y="322" font-size="12" fill="#1c1c1e" text-anchor="middle">K 线 / 计划 / 追踪 / 备份</text>
+
+  <!-- right column: sqlite -->
+  <path d="M800,140 L800,198" stroke="#9a9aa2" stroke-width="1.2" marker-end="url(#ar)"/>
+  <rect x="624" y="40" width="176" height="100" rx="9" fill="#fff" stroke="#dcdce2"/>
+  <text x="712" y="62" font-size="12.5" font-weight="600" fill="#1c1c1e" text-anchor="middle">SQLite 计划 / 追踪</text>
+  <text x="712" y="82" font-size="11" fill="#6e6e73" text-anchor="middle">WAL + synchronous=FULL</text>
+  <text x="712" y="99" font-size="11" fill="#6e6e73" text-anchor="middle">启动/写入后在线快照备份</text>
+  <text x="712" y="116" font-size="11" fill="#6e6e73" text-anchor="middle">滚动保留 40 份快照</text>
+
+  <rect x="800" y="198" width="196" height="76" rx="11" fill="#fff" stroke="#dcdce2"/>
+  <text x="818" y="220" font-size="12" font-weight="600" fill="#1c1c1e">前端（无构建）</text>
+  <text x="818" y="239" font-size="11" fill="#6e6e73">index.html + app.js + ECharts</text>
+  <text x="818" y="256" font-size="11" fill="#6e6e73">资源指纹 ?v=md5 前缀</text>
+</svg>
+</div>
+
+<h2>4. 三条核心算法</h2>
+
+<h3>4.1 放量选股 —— 快在「不在 1600 万行上做逐行判断」</h3>
+<ul>
+  <li><b>均量口径</b>：<code>ma_volume</code> 取<b>前 M 日</b>（不含当日）成交量均值 → 不引入未来函数。</li>
+  <li><b>去重</b>：同一只股票在回看窗口内多次放量，只保留<b>最近一次</b>信号。</li>
+  <li><b>过滤下沉到类别层</b>：代码前缀、板块、行业、概念这些「每股一份」的判断，
+    先对 5 608 个 <code>category</code> 算一次掩码，再 <code>cat_ok[cat_codes]</code> 展开成行级布尔。
+    逐行 <code>.map(dict)</code> 会又慢又费内存。</li>
+  <li><b>均量与根数按需算</b>：<code>_attach_volume_stats()</code> 只对命中行求前 window 根之和（约 5 600×20 = 11 万元素），
+    float64 逐值精确；<code>bar_total</code> 在类别上做一次 <code>searchsorted</code>，必须按<b>锚点日</b>取值，
+    否则回看 2022 年时 2022-05 才上市的票会被误判成「K 线充足」。</li>
+</ul>
+
+<h3>4.2 涨跌停与连板 —— 精度全部落在「分」上</h3>
+<ul>
+  <li><b>基准价 = 前一根 K 线收盘</b>。文件第 8 个 uint32 名义上是「上日收盘」，但实测自 <b>2015-12-16 起全市场失效</b>
+    （多为占位值 <code>65536</code> 或 <code>0</code>），所以既不落缓存列，也不使用。</li>
+  <li>涨停价 <code>(prev_c × f + 50) // 100</code>，用<b>整数分</b>算 —— 浮点会在 0.01 元边界上抖动。
+    <code>f</code>：主板 110 / 创业板·科创板 120 / 北交所 130 / ST 105。</li>
+  <li><b>上市首日剔除</b>；跌停额外要求「最低价 ≥ 跌停价」，用于排除除权造成的假跌停。</li>
+  <li><b>封板形态</b>：一字板（最低价 = 涨停价）/ T 字板（开 ≥ 涨停价但盘中打开）/ 换手板 —— 判断「明天还能不能继续」最直接的一眼信息。</li>
+  <li><b>连板计数全向量化</b>：<code>(n_cat, window)</code> 右对齐矩阵展平后
+    <code>streak_all = np.where(boundary, 0, gp − accumulate(...))</code>，
+    实测 0.05~0.16 s（含 2015/2018/2022 等历史日期），没有逐股循环。</li>
+</ul>
+<div class="danger">
+  <b>本机数据里「ST 股 5% 带宽」并不成立。</b>2026-09-23 实测：144 只名称含 ST 的主板股中 141~142 只（≈97.9%）
+  出现过「日内最高价 &gt; 前收 × 1.05」，<code>high/前收</code> 的 p99.9 ≈ <b>1.10</b>。
+  也就是说这批行情里主板 ST 的带宽也是 10%。<b>因此 <code>st_limit</code> 默认关闭</b>；
+  打开会把 <code>2026-06-01</code> 从 120 只变成 168 只。<br>
+  <b>教训：名称里的「ST」前缀 ≠ 5% 带宽 —— 判涨跌幅限制要看行情本身，不能只信名称。</b>
+</div>
+
+<h3>4.3 板块交集 —— 一个纯集合问题</h3>
+<p>限定在「锚点日有行情 + 通过轻量过滤」的候选集内：<code>A = 选中二级行业</code>（多选为并集）、
+<code>B = 选中概念</code>（可任一 / 全部），结果 <code>= A ∩ B</code>。</p>
+<ul>
+  <li><b>行业侧只给并集</b>：一只标的的二级行业是单值，选两个行业求交恒为空 —— 给「全部命中」反而误导。概念是列表，故 <code>any</code> / <code>all</code> 都有意义。</li>
+  <li><b>空交集给「下一步往哪调」</b>：把「A 里最常出现的概念」「B 里最常出现的二级行业」两组标签回给前端，
+    点一下就并入对应一侧。空结果本身没法自查，这两组数字就是自查入口。</li>
+  <li><b>明确报错而不是静默空结果</b>：未知行业/概念名、两侧都不选、空板块、空交易所、越界日期，
+    全部 <code>ok=false</code> + 原因，且走 HTTP 200 而非 500。</li>
+  <li><b>口径透明</b>：<code>warnings</code> 里会说明概念归属缺失只数，以及「回溯历史日期时，板块成分仍是本地文件的<b>当前</b>成份」——
+    是「用今天的板块看历史行情」，不是历史快照。</li>
+</ul>
+
+<h2>5. 本地数据格式速查</h2>
+<table>
+  <tr><th>文件</th><th>格式要点</th><th>规模（实测）</th></tr>
+  <tr><td><code>vipdoc/{sh,sz,bj}/lday/*.day</code></td>
+      <td>定长 32 字节 <code>&lt;IIIIIfII</code>；价格单位<b>分</b>、成交量单位<b>股</b>；第 8 字段已失效</td>
+      <td class="num">9 755 个文件<br>5 608 只 A 股</td></tr>
+  <tr><td><code>hq_cache/{shs,szs,bjs}.tnf</code></td>
+      <td>N×360 字节记录；名称在 <code>[81:89]</code>（GBK），代码取名称前 40 字节内最后一段 6 位数字</td>
+      <td class="num">52 163 条<br>覆盖 ~97%</td></tr>
+  <tr><td><code>hq_cache/tdxhy.cfg</code></td>
+      <td>GBK 6 字段 <code>市场|代码|T码|||X码</code>；市场 0 深 / 1 沪 / 2 京</td>
+      <td class="num">5 584 只映射<br>覆盖 99.3%</td></tr>
+  <tr><td><code>incon.dat</code></td>
+      <td>分段表：<code>#TDXNHY</code>（T 码）、<code>#TDXRSHY</code>（X 码，本研究行业）、<code>#SWHY</code>（申万，<b>本地无归属文件，不可用</b>）</td>
+      <td class="num">30 / 128 / 316</td></tr>
+  <tr><td><code>hq_cache/infoharbor_block.dat</code></td>
+      <td>板块头 + 成分行；前缀 <code>GN_</code> 概念 / <code>FG_</code> 风格 / <code>ZS_</code> 指数</td>
+      <td class="num">269 概念<br>46 586 归属</td></tr>
+  <tr><td><code>hq_cache/tdxzs.cfg</code></td>
+      <td><code>板块名|880xxx|类型码|…</code>；<b>类型码 4 = 概念</b></td>
+      <td class="num">与 block 文件按指数代码求交 269/269 零残差</td></tr>
+  <tr><td><code>hq_cache/gbbq</code></td>
+      <td>加密二进制股本变迁（20 万条）；取每只 <code>category == 5</code> 最后一条的「变动后流通股本」</td>
+      <td class="num">5 922 只<br>覆盖 100%</td></tr>
+</table>
+<div class="note">
+  <b>两个命名坑（已踩过）：</b>① <code>92xxxx</code>（如 <code>920427</code>）是<b>北交所</b>，判定必须放在「9 开头 = 沪市」之前，否则读不到文件；
+  ② 概念板块在两个文件里的命名口径不同（简称 vs 全称，36 个有差异），<b>交叉验证只能按板块指数代码</b>，按名字会错。
+</div>
+
+<h2>6. 工程红线（改代码前先过一眼）</h2>
+<table>
+  <tr><th>红线</th><th>为什么</th></tr>
+  <tr><td>重建缓存必须拿 <code>_refresh_lock</code>，并在锁内重判 freshness</td>
+      <td>否则「启动预加载」与手点「刷新数据」会同时写同一个 <code>bars.parquet.tmp</code></td></tr>
+  <tr><td><code>volume</code> 必须 <code>uint32</code></td>
+      <td>float32 在 41.7 亿股处 ULP = 256 股，前端「手」会偏 1~2 手；源本身就是 u4，无损</td></tr>
+  <tr><td><code>bar_total</code> 按锚点日取值，不是整段历史长度</td>
+      <td>否则回看历史日期时，上市晚的票会被误判成「K 线充足」</td></tr>
+  <tr><td>分布卡基数 <code>summary_base</code> 在过滤<b>之前</b>取快照</td>
+      <td>放在之后会导致「点一个行业后，其余行业标签全消失」</td></tr>
+  <tr><td><code>as_multi()</code> 必须挡住裸字符串</td>
+      <td><code>[b for b in "主板"]</code> → <code>['主','板']</code> → 静默匹配不到、<b>返回空结果不报错</b></td></tr>
+  <tr><td><code>#klineChart</code> 必须是 <code>.drawer-body</code> 的直接子元素</td>
+      <td>曾因多一个 <code>&lt;/div&gt;</code> 被解析到 <code>.drawer</code> 下，控制台无报错、页面照常打开，但图表被压扁</td></tr>
+  <tr><td>前端改动必须走资源指纹（<code>?v=</code> + 响应头）</td>
+      <td>否则旧标签页继续跑旧 <code>app.js</code>，表现是「改了前端没生效」，极易误判成后端问题</td></tr>
+  <tr><td>测试脚本只允许删自己创建的数据</td>
+      <td><code>persist_test.py</code> 曾因遍历接口全部条目 DELETE，在有用户数据的库上跑一次就全删光</td></tr>
+  <tr><td>测试里不写死「A 股总数 / 命中数」</td>
+      <td>数据一更新（新股/退市）就变成过期假失败，只写不变量与交叉核对</td></tr>
+</table>
+
+<h2>7. 本次核对到的状态（2026-09-24）</h2>
+<table>
+  <tr><th>项</th><th>结果</th></tr>
+  <tr><td>工作区位置</td><td><code>E:\sourcecode\stock_picker</code>（旧笔记里的 <code>F:\source\stock_rsi</code>、<code>F:\source\stock_blocks</code> <b>已不存在</b>）</td></tr>
+  <tr><td>运行中实例</td><td>源码态 <code>127.0.0.1:8771</code>，<code>frozen: false</code>，健康检查通过</td></tr>
+  <tr><td><code>dist/</code></td><td>只有 <code>config.json</code> + <code>data/</code> + <code>使用说明.txt</code>，<b>没有 exe</b>；<code>dist/data/stock_picker.db</code> 里是用户真实数据（3 计划 + 1 追踪）</td></tr>
+  <tr><td>默认选股</td><td>扫主板 <b>3 227</b> 只（全市场 5 608）→ 命中 <b>154</b> 只，<code>screen_elapsed 0.179 s</code>；首行 002238 天威视讯，量比 12.55（<span class="up">+10.05%</span>）</td></tr>
+  <tr><td>连板梯队</td><td>2026-09-24：涨停 <b>52</b> / 首板 39 / 2 板 8 / 3 板+ 5 / 最高 <b>5 板</b>（601811 新华文轩）/ 一字 4 / 跌停 16 / 触板未封 14 / 晋级率 25.5%</td></tr>
+  <tr><td>行情缓存</td><td><code>bars.parquet</code> 344.4 MB / 16 202 033 行 / 5 608 只，2026-09-24 19:43 建，耗时 18.8 s，<code>failed: 0</code></td></tr>
+  <tr><td><b>缓存新鲜度</b></td><td class="up"><code>stale = true</code> —— 本地行情 21:12:46 比缓存 19:43:03 新。运行中实例内存里仍是旧快照，需重建（重启或 <code>POST /api/preload</code>）才是完整的盘后数据</td></tr>
+  <tr><td>行情起点</td><td>个股本地行情自 <b>2001-01-02</b> 起（<code>sh600000</code> 6 124 根）；旧笔记「1991-01-02 / 8 786 交易日」<b>已作废</b>，只有指数 <code>sh999999</code> 到 1990-12-19</td></tr>
+  <tr><td>额外发现</td><td><code>D:\new_tdx\vipdoc\ds\lday</code> 有 <b>19 785</b> 个 <code>.day</code>（外汇/期货/全球指数）。项目代码用 <code>MARKETS = ("sh","sz","bj")</code> 明确不碰；<b>自写脚本 glob <code>vipdoc/*/lday</code> 会把这 1.9 万个文件算进去</b></td></tr>
+</table>
+
+<h2>8. 已知限制（README 第 8 节有完整版）</h2>
+<ul>
+  <li>数据<b>不复权</b>：长期回看时除权股价格与均量会跳变；连板判定在除权日<b>可能漏判涨停</b>（唯一无法靠数据修掉的一点）。</li>
+  <li>创业/科创板上市前 5 个交易日、北交所首日、停牌复牌当天<b>无涨跌幅限制</b>，本口径只剔除上市首日。</li>
+  <li>流通股本是「最近一次股本变化」的值，<b>不是逐日历史股本</b> → 用历史日期回看时市值用的是当前股本。</li>
+  <li>板块归属（行业 / 概念）都是<b>当前</b>值，不是历史快照；167 只 A 股在本地文件里没有任何概念归属。</li>
+  <li>概念数多 ≠ 题材强（平均每股 8.56 个、最多 49 个），工具只做归属展示与筛选，不做题材强度打分。</li>
+  <li>连板梯队的基准交叉核对依赖兄弟项目 <code>stock_watch</code> 的 <code>universe.parquet</code>；
+    该文件随 <code>F:</code> 盘一起消失，<b>要重跑这条校验得先找回兄弟项目</b>。</li>
+  <li>工具只做筛选与记录，<b>不构成任何投资建议</b>。</li>
+</ul>
+
+<footer>
+  导读基于 <code>stock_picker/README.md</code> 全文 + 后端/前端源码骨架 + 本机接口实测生成。
+  README 仍是权威文档；本页只做结构化的二次组织，便于快速上手。
+</footer>
+
+</div>
+</body>
+</html>

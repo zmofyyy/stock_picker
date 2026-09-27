@@ -15,6 +15,8 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -75,32 +77,6 @@ names = NameIndex(
 reader = TdxReader(config.get("tdx_dir"), mode=config.get("reader_mode", "fast"))
 service = MarketService(config, reader, names)
 store = Store(DATA_DIR / "stock_picker.db")
-
-app = FastAPI(title="stock_picker", version="1.0.0", docs_url="/api/docs")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.middleware("http")
-async def _no_cache(request, call_next):
-    """本地单机工具，绝不让浏览器留旧副本。
-
-    - ``/api/*`` → ``no-store``：接口返回的是瞬时数据（交易日、行情、命中集），
-      且 GET 接口在没有 ``Cache-Control`` 时会被浏览器启发式缓存。
-    - 页面 HTML → ``no-store``：保证每次打开都带上最新的资源指纹。
-    - ``/static/*`` → ``no-cache, must-revalidate``：允许 304 省流量，但必须回源
-      校验；配合 URL 上的 ``?v=指纹``，内容一变就彻底绕开旧缓存条目。
-    """
-    resp = await call_next(request)
-    if request.url.path.startswith("/static/"):
-        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
-    else:
-        resp.headers["Cache-Control"] = "no-store"
-    return resp
 
 # ----------------------------------------------------------------------
 # 后台任务
@@ -168,14 +144,74 @@ def _run_preload_job(*, auto: bool = False) -> str:
     return job_id
 
 
-@app.on_event("startup")
-def _startup_preload() -> None:
+def _on_startup() -> None:
     """服务一启动就把本地已存在的数据全部载入（后台线程，不阻塞端口就绪）。"""
     if not bool(_bootstrap_cfg().get("preload", True)):
         print("启动预加载已关闭（config.bootstrap.preload = false）")
         return
     job_id = _run_preload_job(auto=True)
     print(f"已在后台预加载本地数据（job {job_id}）…")
+
+
+def _on_shutdown() -> None:
+    """退出前补一份快照并关掉数据库连接（WAL 已 checkpoint）。"""
+    try:
+        store._maybe_backup("shutdown", 300.0)
+    except Exception:
+        pass
+    store.close()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """应用生命周期（FastAPI 新版写法，替代已弃用的 ``@app.on_event``）。
+
+    - **startup**：只做一件轻活 —— 起一个后台线程跑 ``MarketService.preload()``。
+      重活都在那条线程里，所以端口先就绪、页面先打开，进度通过
+      ``GET /api/bootstrap`` 暴露给前端。
+    - **shutdown**：补一份 SQLite 快照再关连接。放在 ``finally`` 里，
+      保证正常退出（uvicorn 收到 Ctrl+C）时一定执行。
+
+    注意 ``preload`` 由 ``config.bootstrap.preload`` 控制，关掉即回到
+    「手动点刷新数据」的老行为。
+    """
+    _on_startup()
+    try:
+        yield
+    finally:
+        _on_shutdown()
+
+
+app = FastAPI(
+    title="stock_picker",
+    version="1.0.0",
+    docs_url="/api/docs",
+    lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def _no_cache(request, call_next):
+    """本地单机工具，绝不让浏览器留旧副本。
+
+    - ``/api/*`` → ``no-store``：接口返回的是瞬时数据（交易日、行情、命中集），
+      且 GET 接口在没有 ``Cache-Control`` 时会被浏览器启发式缓存。
+    - 页面 HTML → ``no-store``：保证每次打开都带上最新的资源指纹。
+    - ``/static/*`` → ``no-cache, must-revalidate``：允许 304 省流量，但必须回源
+      校验；配合 URL 上的 ``?v=指纹``，内容一变就彻底绕开旧缓存条目。
+    """
+    resp = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    else:
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/api/bootstrap")
@@ -353,6 +389,97 @@ def kline(
         return service.kline(code, bars=bars, ma_window=ma_window)
     except Exception as exc:
         raise HTTPException(500, f"读取 K 线失败：{exc}") from exc
+
+
+@app.get("/api/board_catalog")
+def board_catalog(rebuild: bool = Query(False)) -> Dict[str, Any]:
+    """板块目录（行业 / 地区 / 概念 / 风格）与每类的板块数。
+
+    数据源是通达信 ``T0002/hq_cache/tdxzs.cfg``（板块指数表，604 条）——
+    比「概念」多出行业与地区两类，用于板块看盘页的类别切换。
+    """
+    if rebuild:
+        service.boards.load(force=True)
+    return {"ok": True, **service.boards.info()}
+
+
+@app.get("/api/board_panel")
+def board_panel(
+    date: Optional[str] = Query(None, description="交易日 YYYY-MM-DD；留空 = 最新交易日"),
+    category: Optional[str] = Query(
+        None, description="板块类别：行业 / 地区 / 概念 / 风格；留空 = 全部"
+    ),
+    sort: str = Query("pct", description="pct/close/amount_yi/vol_ratio/turnover/n_up/n_limit_up/avg_pct/name/code/order"),
+    order: str = Query("desc", description="asc / desc"),
+    keyword: str = Query("", max_length=40, description="按板块名或指数代码搜索"),
+    limit: int = Query(0, ge=0, le=2000, description="0 = 不截断（604 个板块全返回）"),
+    with_members_only: bool = Query(False, description="只保留有成分股数据的板块"),
+) -> Dict[str, Any]:
+    """板块看盘：每个板块在锚点日的行情与成分统计。
+
+    指标分两部分：**板块指数自身行情**（涨幅 / 成交额 / 量比，读
+    ``vipdoc/sh/lday/sh880xxx.day``）与**成分股聚合**（涨跌家数 / 涨停跌停数 /
+    平均涨幅 / 换手率）。地区板块本地没有成分文件，只有前半部分。
+
+    ``summary`` 在 ``limit`` 截断**之前**统计，用来看「604 个板块里几个在涨」。
+    """
+    params: Dict[str, Any] = {
+        "date": date,
+        "category": category,
+        "sort": sort,
+        "order": order,
+        "keyword": keyword,
+        "limit": max(0, int(limit)),
+        "with_members_only": bool(with_members_only),
+    }
+    try:
+        return service.board_panel(params)
+    except Exception as exc:
+        raise HTTPException(500, f"板块看盘计算失败：{exc}") from exc
+
+
+@app.get("/api/board_members")
+def board_members(
+    board: str = Query(..., description="板块指数代码，如 880301（煤炭）"),
+    date: Optional[str] = Query(None, description="交易日 YYYY-MM-DD；留空 = 最新交易日"),
+    sort: str = Query("pct", description="pct/close/amount_yi/vol_ratio/turnover/float_mcap_yi/industry_l2/concept_n/code/name"),
+    order: str = Query("desc", description="asc / desc"),
+    limit: int = Query(0, ge=0, le=3000, description="0 = 不截断"),
+    ma_window: int = Query(20, ge=2, le=250, description="量比基准的前 N 日均量窗口"),
+) -> Dict[str, Any]:
+    """板块成分股明细（点选板块后右侧列表）。
+
+    只列**锚点日有行情**的成分股（停牌股不进列表），``n_total`` 是静态成分数、
+    ``n_suspended`` 是两者之差。
+    """
+    params: Dict[str, Any] = {
+        "board": board,
+        "date": date,
+        "sort": sort,
+        "order": order,
+        "limit": max(0, int(limit)),
+        "ma_window": int(ma_window),
+    }
+    try:
+        return service.board_members(params)
+    except Exception as exc:
+        raise HTTPException(500, f"读取板块成分股失败：{exc}") from exc
+
+
+@app.get("/api/board_kline/{code}")
+def board_kline(
+    code: str,
+    bars: int = Query(160, ge=30, le=1000),
+) -> Dict[str, Any]:
+    """板块指数 K 线（含均线、均量、放量标记与 MACD）。
+
+    ``code`` 是板块指数代码（``880xxx``），读 ``vipdoc/sh/lday``，与个股 K 线
+    返回**同一套结构**（前端一套渲染）。
+    """
+    try:
+        return service.index_kline(code, bars=bars)
+    except Exception as exc:
+        raise HTTPException(500, f"读取板块指数 K 线失败：{exc}") from exc
 
 
 @app.get("/api/trade_dates")
@@ -644,15 +771,6 @@ def download_backup(name: str) -> FileResponse:
     if not target.is_file():
         raise HTTPException(404, f"备份不存在：{safe}")
     return FileResponse(str(target), filename=safe, media_type="application/octet-stream")
-
-
-@app.on_event("shutdown")
-def _shutdown() -> None:
-    try:
-        store._maybe_backup("shutdown", 300.0)
-    except Exception:
-        pass
-    store.close()
 
 
 # ----------------------------------------------------------------------

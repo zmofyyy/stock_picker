@@ -41,6 +41,15 @@
         </svg>
         <span>连板梯队</span>
       </button>
+      <button class="tab" data-tab="board">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="7.5" height="7.5" rx="1.5" />
+          <rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5" />
+          <rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5" />
+          <rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5" />
+        </svg>
+        <span>板块看盘</span>
+      </button>
       <button class="tab" data-tab="intersect">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="9.6" cy="12" r="6.3" />
@@ -301,6 +310,115 @@
               </thead>
               <tbody></tbody>
             </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 板块看盘（照着行情软件的四宫格：上两栏列表、下两栏图） ====== -->
+      <section class="panel" id="panel-board">
+        <div class="bp-tabs-row">
+          <div class="bp-tabs" id="bpTabs" role="tablist" aria-label="板块类别">
+            <button type="button" class="bp-tab active" data-cat="概念" role="tab" aria-selected="true"
+                    title="题材概念板块 · 成分来自 infoharbor_block.dat 的 GN_ 段">
+              <i></i>概念板块<b></b>
+            </button>
+            <button type="button" class="bp-tab" data-cat="行业" role="tab" aria-selected="false"
+                    title="通达信行业分类 · 成分按 tdxhy.cfg 的 T 码归属聚合">
+              <i></i>行业板块<b></b>
+            </button>
+          </div>
+          <span class="bp-tabs-note">地区板块本地无成分文件、风格板块是因子指标，两者不入主视图</span>
+        </div>
+
+        <div class="card">
+          <div class="filters">
+            <label>交易日
+              <span class="date-field">
+                <input type="date" id="bpDate" title="留空＝最新交易日；仅支持交易日" />
+                <button type="button" class="mini" id="bpDateLatest" title="清除，回到最新交易日">最新</button>
+              </span>
+            </label>
+            <label>搜索板块
+              <input id="bpSearch" placeholder="名称或 880xxx" maxlength="40" />
+            </label>
+            <label class="chk" title="只保留本地有成分股数据的板块（地区板块没有成分文件）">
+              <input type="checkbox" id="bpOnlyMembers" checked /> 仅有成分
+            </label>
+            <button class="btn primary" id="btnBoardLoad">加载板块</button>
+          </div>
+          <ul class="conditions" id="boardConditions"></ul>
+        </div>
+
+        <div class="bp-split">
+          <div class="card bp-pane">
+            <div class="card-head">
+              <h2>板块 <span class="muted" id="bpBoardMeta"></span></h2>
+              <span class="muted hint">点一行：出成分股 + 板块指数 K 线</span>
+            </div>
+            <div class="bp-wrap">
+              <table id="bpBoardTable">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-sort="code" data-label="代码">代码</th>
+                    <th class="sortable" data-sort="name" data-label="名称">名称</th>
+                    <th class="num sortable" data-sort="pct" data-label="涨幅">涨幅%</th>
+                    <th class="num sortable" data-sort="amount_yi" data-label="成交额">成交额(亿)</th>
+                    <th class="num sortable" data-sort="vol_ratio" data-label="量比">量比</th>
+                    <th class="num sortable" data-sort="turnover" data-label="换手">换手%</th>
+                    <th class="num sortable" data-sort="n_up" data-label="涨跌家数">涨/跌</th>
+                    <th class="num sortable" data-sort="n_limit_up" data-label="涨停">涨停</th>
+                    <th class="num sortable" data-sort="n_members" data-label="成分">成分</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card bp-pane">
+            <div class="card-head">
+              <h2>成分股 <span class="muted" id="bpMemberMeta"></span></h2>
+              <span class="muted hint" id="bpMemberHint">点一行：出个股 K 线</span>
+            </div>
+            <div class="bp-wrap">
+              <table id="bpMemberTable">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-sort="code" data-label="代码">代码</th>
+                    <th class="sortable" data-sort="name" data-label="名称">名称</th>
+                    <th class="sortable" data-sort="industry_l2" data-label="二级行业">二级行业</th>
+                    <th class="num sortable" data-sort="pct" data-label="涨幅">涨幅%</th>
+                    <th class="num sortable" data-sort="close" data-label="现价">现价</th>
+                    <th class="num sortable" data-sort="amount_yi" data-label="成交额">成交额(亿)</th>
+                    <th class="num sortable" data-sort="vol_ratio" data-label="量比">量比</th>
+                    <th class="num sortable" data-sort="turnover" data-label="换手">换手%</th>
+                    <th class="num sortable" data-sort="volume_hand" data-label="成交量">成交量(万手)</th>
+                    <th class="num sortable" data-sort="float_mcap_yi" data-label="流通市值">流通市值(亿)</th>
+                    <th class="num sortable" data-sort="concept_n" data-label="概念">概念</th>
+                    <th class="sortable" data-sort="board" data-label="板块">板块</th>
+                    <th class="sortable" data-sort="limit" data-label="涨跌停">涨跌停</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="bp-charts">
+          <div class="card">
+            <div class="card-head">
+              <h2 id="bpIndexTitle">板块指数 K 线</h2>
+              <span class="muted" id="bpIndexMeta">先在上面选一个板块</span>
+            </div>
+            <div class="chart" id="bpIndexChart"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h2 id="bpStockTitle">个股 K 线</h2>
+              <span class="muted" id="bpStockMeta">再点一只成分股</span>
+            </div>
+            <div class="chart" id="bpStockChart"></div>
           </div>
         </div>
       </section>

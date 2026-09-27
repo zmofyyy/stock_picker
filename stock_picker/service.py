@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from .boards import BoardIndex
 from .config import CACHE_DIR, Config
 from .concepts import ConceptIndex
 from .industry import IndustryIndex
@@ -28,7 +29,9 @@ from .limits import (
 from .names import NameIndex
 from .shares import FloatShareIndex
 from .tdx_reader import (
+    BARS_COLUMNS,
     CACHE_DTYPES,
+    DAY_DTYPE,
     TdxReader,
     board_of,
     is_a_share,
@@ -130,7 +133,17 @@ class MarketService:
             self.shares.load(force=False)
         except Exception:
             pass
+        self.boards = BoardIndex(
+            config.get("tdx_dir"), cache_file=CACHE_DIR.parent / "boards.json"
+        )
+        try:
+            self.boards.load(force=False)
+        except Exception:
+            pass
         self._bars: Optional[pd.DataFrame] = None
+        #: 板块指数日线尾部：``{指数代码: (文件 mtime, DataFrame)}`` —— 指数不在
+        #: 主缓存里（那里只有 A 股正股），单独读且按 mtime 记忆化。
+        self._index_cache: Dict[str, Any] = {}
         #: 全市场唯一交易日（升序 int32），随行情缓存失效
         self._all_dates: Optional[np.ndarray] = None
         #: 「每只股票截至某日的 K 线根数」按需算、按日期记忆化
@@ -211,6 +224,7 @@ class MarketService:
             self._all_dates = None
             self._barcount_cache.clear()
             self._group_bounds_cache = None
+            self._index_cache.clear()
 
     def refresh(
         self, progress: Optional[Callable[[Dict[str, Any]], None]] = None
@@ -399,8 +413,8 @@ class MarketService:
     ) -> Dict[str, Any]:
         """启动即预加载：把本地**已存在**的数据全部载入就绪。
 
-        顺序：名称表 → 行业 → 概念 → 流通股本 → 行情缓存（缺失/过期则重建）
-        → 均量统计预热。每一步都记进 ``steps``，供前端显示与人查证。
+        顺序：名称表 → 行业 → 概念 → 板块目录 → 流通股本 → 行情缓存（缺失/过期则
+        重建）→ 交易日索引。每一步都记进 ``steps``，供前端显示与人查证。
         """
         started = time.perf_counter()
         steps: List[Dict[str, Any]] = []
@@ -432,6 +446,11 @@ class MarketService:
              lambda _: {"codes": self.industries.size, "l2": len(self.industries.l2_names())})
         _try("概念板块", lambda: self.concepts.load(force=False),
              lambda _: {"concepts": self.concepts.concept_count, "codes": self.concepts.size})
+        _try("板块目录", lambda: self.boards.load(force=False),
+             lambda _: {
+                 "boards": self.boards.size,
+                 "with_members": int((self.boards.meta or {}).get("boards_with_members") or 0),
+             })
         _try("流通股本", lambda: self.shares.load(force=False),
              lambda _: {"codes": int((self.shares.info() or {}).get("size") or 0)})
 
@@ -502,6 +521,7 @@ class MarketService:
                 "names": self.names.size,
                 "industries": self.industries.size,
                 "concepts": self.concepts.concept_count,
+                "boards": self.boards.size,
                 "float_shares": int((self.shares.info() or {}).get("size") or 0),
             },
             "steps": steps,
@@ -1736,20 +1756,569 @@ class MarketService:
     # ------------------------------------------------------------------
     # K 线
     # ------------------------------------------------------------------
-    def kline(self, code: str, bars: int = 160, ma_window: int = 20) -> Dict[str, Any]:
-        """返回单只股票的 K 线（含均线、均量与放量标记）。"""
-        std = normalize_code(code)
+    # ------------------------------------------------------------------
+    # 板块看盘（行业 / 地区 / 概念 / 风格）
+    # ------------------------------------------------------------------
+    def _index_dir(self) -> Optional[Path]:
+        """板块指数日线目录（``vipdoc/sh/lday``）。"""
+        vipdoc = self.reader.vipdoc
+        if vipdoc is None:
+            return None
+        d = vipdoc / "sh" / "lday"
+        return d if d.is_dir() else None
+
+    def _index_bars(self, index_code: str, tail: int = 25) -> Optional[pd.DataFrame]:
+        """读板块指数日线（只取尾部 ``tail`` 根），按文件 mtime 记忆化。
+
+        板块指数（``880xxx``）**不在主行情缓存里** —— 那里只装 A 股正股
+        （``is_a_share`` 的规则排除指数）。指数文件很大（约 3600 根 / 116KB），
+        而看盘只用到尾部几十根，所以这里 **seek 到文件尾部只读需要的字节**：
+        604 个板块齐扫约 20ms，整读一遍要 0.9s。
+
+        缓存记的是 ``(mtime, 已读根数, df)`` —— **必须带「已读根数」**：
+        板块列表只要 22 根（算 20 日均量），而 K 线图要 200+ 根，只按 mtime
+        命中就会把 22 根的那份交给 200 根的请求（K 线图会只剩一小截）。
+        """
+        d = self._index_dir()
+        if d is None:
+            return None
+        path = d / f"sh{index_code}.day"
+        if not path.is_file():
+            return None
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        n = max(1, int(tail))
+        hit = self._index_cache.get(index_code)
+        if hit is not None and hit[0] == st.st_mtime and hit[1] >= n:
+            return hit[2]
+        take = min(st.st_size, n * DAY_DTYPE.itemsize)
+        if take <= 0:
+            return None
+        with path.open("rb") as fh:
+            fh.seek(st.st_size - take)
+            raw = fh.read(take)
+        cnt = len(raw) // DAY_DTYPE.itemsize
+        if cnt == 0:
+            return None
+        arr = np.frombuffer(raw[: cnt * DAY_DTYPE.itemsize], dtype=DAY_DTYPE)
+        df = pd.DataFrame(
+            {
+                "date": arr["date"].astype("int64"),
+                "open": arr["open"].astype("float64") / 100.0,
+                "high": arr["high"].astype("float64") / 100.0,
+                "low": arr["low"].astype("float64") / 100.0,
+                "close": arr["close"].astype("float64") / 100.0,
+                "volume": arr["volume"].astype("float64"),
+                "amount": arr["amount"].astype("float64"),
+            }
+        )
+        df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+        df = df.reset_index(drop=True)
+        # 涨跌幅按**前一根收盘**算（与主行情缓存同口径：``.day`` 自带的第 8 个
+        # 字段早已失效，见 limits.py）。窗口第一根没有前收盘 → NaN，
+        # 调用方（K 线图）总会多读 70 根，展示区间内的 pct 都是有效的。
+        df["pct"] = df["close"].pct_change()
+        # 文件本身比请求的还短 → 已经读到文件开头，之后任何 tail 都够用
+        covered = n if cnt >= n else 10**9
+        with self._lock:
+            self._index_cache[index_code] = (st.st_mtime, covered, df)
+        return df
+
+    def _anchor(
+        self, params: Dict[str, Any]
+    ) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
+        """解析锚点交易日（``params["date"]``，空 = 最新）。
+
+        与选股 / 连板一样**锚在全市场交易日上**，否则停牌板块会拿自己的最后一根
+        冒充当日行情。
+        """
+        all_dates = self.all_dates()
+        if len(all_dates) == 0:
+            return None, {"ok": False, "reason": "本地行情缓存为空，请先点『刷新数据』"}
+        raw = params.get("date")
+        if raw:
+            d = iso_to_ymd(str(raw))
+            if not np.isin(d, all_dates):
+                return None, {
+                    "ok": False,
+                    "rows": [],
+                    "reason": f"{ymd_to_iso(d)} 不是本地数据里的交易日"
+                    f"（可选范围 {ymd_to_iso(int(all_dates[0]))} ~ "
+                    f"{ymd_to_iso(int(all_dates[-1]))}）",
+                    "date_out_of_range": True,
+                    "date_min": ymd_to_iso(int(all_dates[0])),
+                    "date_max": ymd_to_iso(int(all_dates[-1])),
+                }
+            return int(d), None
+        return int(all_dates[-1]), None
+
+    def _anchor_snapshot(self, anchor: int) -> pd.DataFrame:
+        """锚点日全市场一行（``code`` 还原成字符串 + OHLCV + ``pct``）。"""
+        df = self.bars()
+        idx = np.flatnonzero(df["date"].to_numpy() == anchor)
+        sub = df.iloc[idx].copy()
+        sub["code"] = sub["code"].astype(object)
+        return sub
+
+    def _anchor_limits(
+        self, anchor: int, st_limit: bool = False
+    ) -> Dict[str, int]:
+        """锚点日各股票的涨跌停判定，``{代码: 1 涨停 / -1 跌停}``（其余不出现）。
+
+        口径完全复用连板梯队的 :mod:`stock_picker.limits`：基准价取**前一根
+        收盘**、上市首日不判定、ST 5% 默认关闭（本机行情实测主板 ST 也是 10%）。
+        这里只要锚点日一天，所以窗口取 2 根就够（够取到「前一根收盘」）。
+        """
+        win = self._streak_window(anchor, 2)
+        rows, cat, pos, seg_len = win["rows"], win["cat"], win["pos"], win["seg_len"]
+        if rows.size == 0:
+            return {}
+        df = self.bars()
+        sub = df.iloc[rows]
+        close = sub["close"].to_numpy(dtype="float64")
+        open_ = sub["open"].to_numpy(dtype="float64")
+        high = sub["high"].to_numpy(dtype="float64")
+        low = sub["low"].to_numpy(dtype="float64")
+        dates = sub["date"].to_numpy()
+        prev = np.full(rows.size, np.nan)
+        if rows.size > 1:
+            same = cat[1:] == cat[:-1]
+            prev[1:] = np.where(same, close[:-1], np.nan)
+        is_ipo = rows == win["starts"][cat]
+        cats = df["code"].cat.categories
+        cat_names = [self.names.get(c) or "" for c in cats]
+        factors = np.fromiter(
+            (limit_factor(c, cat_names[i], st_limit) for i, c in enumerate(cats)),
+            dtype="int64",
+            count=len(cats),
+        )
+        lu, _tu, ld = limit_masks(close, high, low, prev, factors[cat], is_ipo)
+        tail = (pos == seg_len - 1) & (dates == anchor)
+        code_of_row = np.asarray(cats, dtype=object)[cat]
+        out: Dict[str, int] = {}
+        for i in np.flatnonzero(tail):
+            i = int(i)
+            if lu[i]:
+                out[str(code_of_row[i])] = 1
+            elif ld[i]:
+                out[str(code_of_row[i])] = -1
+        return out
+
+    def _board_aggregate(
+        self, anchor: int, index_codes: Sequence[str]
+    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        """把锚点日行情按板块成分聚合（涨跌家数 / 涨停数 / 成交额 / 换手）。
+
+        一只股票属于多个板块（实测平均 8.5 个概念），所以先把
+        ``(板块, 股票)`` 展平成对，再与当日行情内联接 —— 一次 ``groupby``
+        就能出全部板块的统计，不做逐板块循环。
+
+        :return: ``(每板块统计, 全市场口径)``。第二个元素里的涨跌停数是**去重**
+            的（全市场当日涨停多少只），可以直接和连板梯队对上；板块级的
+            ``n_limit_up`` 是「该板块内有几只涨停」，跨板块相加会重复计同一只股。
+        """
+        pairs: List[tuple] = []
+        for ic in index_codes:
+            for c in self.boards.members_of(ic):
+                pairs.append((ic, c))
+        if not pairs:
+            return {}, {}
+        pair_df = pd.DataFrame(pairs, columns=["board", "code"])
+        snap = self._anchor_snapshot(anchor)[
+            ["code", "close", "pct", "volume", "amount"]
+        ]
+        m = pair_df.merge(snap, on="code", how="inner")
+        whole = {
+            "quoted_all": int(len(snap)),
+            "limit_up_all": 0,
+            "limit_down_all": 0,
+        }
+        if len(m) == 0:
+            return {}, whole
+
+        lim = self._anchor_limits(anchor)
+        whole["limit_up_all"] = sum(1 for v in lim.values() if v == 1)
+        whole["limit_down_all"] = sum(1 for v in lim.values() if v == -1)
+        m["lim"] = m["code"].map(lim).fillna(0).astype("int8")
+        m["is_up"] = m["pct"] > 0
+        m["is_down"] = m["pct"] < 0
+        m["is_flat"] = m["pct"] == 0
+        m["is_lu"] = m["lim"] == 1
+        m["is_ld"] = m["lim"] == -1
+        share_map = {c: self.shares.get(c) for c in m["code"].unique()}
+        m["fs"] = m["code"].map(share_map).astype("float64")
+
+        g = m.groupby("board", sort=False)
+        agg = g.agg(
+            n_members=("code", "size"),
+            n_up=("is_up", "sum"),
+            n_down=("is_down", "sum"),
+            n_flat=("is_flat", "sum"),
+            n_limit_up=("is_lu", "sum"),
+            n_limit_down=("is_ld", "sum"),
+            avg_pct=("pct", "mean"),
+            amount=("amount", "sum"),
+            volume=("volume", "sum"),
+            float_shares=("fs", "sum"),
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        for board, r in agg.iterrows():
+            fs = float(r["float_shares"])
+            vol = float(r["volume"])
+            avg = r["avg_pct"]
+            out[str(board)] = {
+                "n_members": int(r["n_members"]),
+                "n_up": int(r["n_up"]),
+                "n_down": int(r["n_down"]),
+                "n_flat": int(r["n_flat"]),
+                "n_limit_up": int(r["n_limit_up"]),
+                "n_limit_down": int(r["n_limit_down"]),
+                "avg_pct": None if pd.isna(avg) else round(float(avg), 5),
+                "amount_yi": fmt_amount_yi(float(r["amount"])),
+                "turnover": round(vol / fs, 5) if fs > 0 else None,
+            }
+        return out, whole
+
+    def _index_quote(
+        self, index_code: str, anchor: int, ma_window: int = 20
+    ) -> Dict[str, Any]:
+        """板块指数在锚点日的行情（涨幅 / 成交额 / 量比）。"""
+        bars = self._index_bars(index_code, tail=max(2, ma_window + 2))
+        if bars is None or len(bars) == 0:
+            return {}
+        sub = bars[bars["date"] <= anchor]
+        if len(sub) == 0:
+            return {}
+        last = sub.iloc[-1]
+        if int(last["date"]) != anchor:
+            # 该板块指数在锚点日没有数据（停牌 / 新板块），不当成 0 涨幅
+            return {"stale_date": ymd_to_iso(int(last["date"]))}
+        prev = float(sub["close"].iloc[-2]) if len(sub) >= 2 else None
+        close = float(last["close"])
+        vols = sub["volume"].to_numpy(dtype="float64")
+        ma_vol = float(vols[-ma_window - 1 : -1].mean()) if len(vols) > ma_window else None
+        vol = float(last["volume"])
+        return {
+            "close": round(close, 3),
+            "prev_close": None if prev is None else round(prev, 3),
+            "pct": None if not prev else round(close / prev - 1.0, 5),
+            "open": round(float(last["open"]), 3),
+            "high": round(float(last["high"]), 3),
+            "low": round(float(last["low"]), 3),
+            "volume": vol,
+            "amount_yi": fmt_amount_yi(float(last["amount"])),
+            "vol_ratio": (
+                round(vol / ma_vol, 3) if ma_vol and ma_vol > 0 else None
+            ),
+        }
+
+    #: 板块列表的可排序字段（键即前端 ``sort`` 参数）
+    BOARD_SORT_KEYS = (
+        "order", "code", "name", "pct", "close", "amount_yi",
+        "vol_ratio", "turnover", "n_up", "n_down", "n_limit_up", "avg_pct",
+    )
+
+    @staticmethod
+    def _sorted_rows(
+        rows: List[Dict[str, Any]],
+        key: str,
+        desc: bool,
+        getter: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """按 ``key`` 排序，**缺值的永远沉底**（不随 asc / desc 翻转）。
+
+        不能直接 ``rows.sort(key=..., reverse=True)``：那会把「缺值」这个哨兵
+        一起反转，于是没有当日行情的板块在降序时反而排到最前面（实测踩过）。
+        先分成「有值 / 缺值」两层，各自再排。
+
+        :param getter: 取排序值的函数；默认取 ``r[key]``（成分股表的键与字段名
+            不同名，例如 ``code`` 取的是 ``symbol``）。
+        """
+        get = getter or (lambda r: r.get(key))
+        present: List[Dict[str, Any]] = []
+        absent: List[Dict[str, Any]] = []
+        for r in rows:
+            (absent if get(r) is None else present).append(r)
+        present.sort(key=get, reverse=desc)
+        return present + absent
+
+    def board_panel(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """板块看盘：全部板块在锚点日的指标列表。
+
+        指标由两部分拼成：**板块指数自己的行情**（涨幅 / 成交额 / 量比，读
+        ``sh880xxx.day``）与**成分股聚合**（涨跌家数 / 涨停跌停数 / 平均涨幅 /
+        换手率）。地区板块本地没有成分文件，只有前半部分。
+
+        :param params: ``date``（锚点交易日）/ ``category``（行业/地区/概念/风格，
+            空 = 全部）/ ``sort`` + ``order``（排序）/ ``keyword``（名称或代码）/
+            ``limit`` / ``with_members_only``
+        """
+        t_start = time.perf_counter()
+        if self.boards.size == 0:
+            return {"ok": False, "reason": "未找到板块指数表 tdxzs.cfg", "rows": []}
+        anchor, err = self._anchor(params)
+        if err is not None:
+            return {**err, "rows": []}
+        assert anchor is not None
+
+        category = str(params.get("category") or "").strip()
+        if category in ("", "全部", "all"):
+            category = ""
+        known = {c["value"] for c in self.boards.categories()}
+        if category and category not in known:
+            return {
+                "ok": False,
+                "rows": [],
+                "reason": f"未知板块类别 {category}（可选：行业 / 地区 / 概念 / 风格）",
+            }
+
+        items = self.boards.catalog(category)
+        index_codes = [c["index_code"] for c in items]
+        agg, whole = self._board_aggregate(anchor, index_codes)
+
+        rows: List[Dict[str, Any]] = []
+        stale = 0
+        for it in items:
+            ic = it["index_code"]
+            q = self._index_quote(ic, anchor)
+            if not q:
+                stale += 1
+            elif q.get("stale_date"):
+                stale += 1
+            a = agg.get(ic) or {}
+            rows.append(
+                {
+                    "index_code": ic,
+                    "name": it["name"],
+                    "show_name": it["show_name"],
+                    "category": it["category"],
+                    "order": it["order"],
+                    "has_members": it["has_members"],
+                    "n_members": it["n"] or None,
+                    "n_quoted": a.get("n_members"),
+                    "close": q.get("close"),
+                    "pct": q.get("pct"),
+                    "amount_yi": q.get("amount_yi"),
+                    "vol_ratio": q.get("vol_ratio"),
+                    "stale_date": q.get("stale_date"),
+                    "n_up": a.get("n_up"),
+                    "n_down": a.get("n_down"),
+                    "n_flat": a.get("n_flat"),
+                    "n_limit_up": a.get("n_limit_up"),
+                    "n_limit_down": a.get("n_limit_down"),
+                    "avg_pct": a.get("avg_pct"),
+                    "turnover": a.get("turnover"),
+                }
+            )
+
+        keyword = str(params.get("keyword") or "").strip().upper()
+        if keyword:
+            rows = [
+                r
+                for r in rows
+                if keyword in str(r["name"]).upper()
+                or keyword in str(r["index_code"])
+            ]
+        if params.get("with_members_only"):
+            rows = [r for r in rows if r["has_members"]]
+
+        key = str(params.get("sort") or "pct")
+        if key not in self.BOARD_SORT_KEYS:
+            key = "pct"
+        order = str(params.get("order") or "desc")
+        if key in ("order", "code", "name"):
+            order = "asc"          # 这三列按升序看更自然（cfg 顺序 / 代码 / 名称）
+        rows = self._sorted_rows(rows, key, order == "desc")
+        # 汇总要在 limit 截断**之前**算，否则「604 个板块里几个在涨」会被
+        # 首屏那几十行带偏
+        summary = {
+            "boards_up": sum(1 for r in rows if (r["pct"] or 0) > 0),
+            "boards_down": sum(1 for r in rows if (r["pct"] or 0) < 0),
+            "boards_flat": sum(1 for r in rows if r["pct"] is not None and not r["pct"]),
+            "boards_no_quote": sum(1 for r in rows if r["pct"] is None),
+            # 全市场口径（去重），可与连板梯队直接对照；不是板块级 n_limit_up 的求和
+            "stocks_quoted": whole.get("quoted_all", 0),
+            "limit_up_stocks": whole.get("limit_up_all", 0),
+            "limit_down_stocks": whole.get("limit_down_all", 0),
+        }
+        total = len(rows)
+        limit = int(params.get("limit") or 0)
+        if limit > 0:
+            rows = rows[:limit]
+
+        return {
+            "ok": True,
+            "date": ymd_to_iso(anchor),
+            "category": category or "全部",
+            "total": total,
+            "count": len(rows),
+            "sort": key,
+            "order": order,
+            "stale": stale,
+            "categories": self.boards.categories(),
+            "summary": summary,
+            "elapsed": round(time.perf_counter() - t_start, 3),
+            "rows": rows,
+        }
+
+    def board_members(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """板块成分股明细（点选板块后右侧列表）。
+
+        只统计**锚点日有行情**的成分股（停牌股不进列表，与行情软件一致）；
+        ``n_total`` 给的是静态成分数，两者之差就是当日停牌 / 未上市的数量。
+        """
+        t_start = time.perf_counter()
+        index_code = str(params.get("board") or params.get("index_code") or "").strip()
+        if not index_code:
+            return {"ok": False, "reason": "缺少板块参数 board（板块指数代码）", "rows": []}
+        info = self.boards.get(index_code)
+        if info is None:
+            return {"ok": False, "reason": f"未知板块 {index_code}", "rows": []}
+        anchor, err = self._anchor(params)
+        if err is not None:
+            return {**err, "rows": []}
+        assert anchor is not None
+
+        codes = self.boards.members_of(index_code)
+        base = {
+            "ok": True,
+            "board": info,
+            "date": ymd_to_iso(anchor),
+            "n_total": len(codes),
+            "rows": [],
+        }
+        if not codes:
+            base["reason"] = "本地没有该板块的成分股数据，只有指数行情"
+            return base
+
         df = self.bars()
         if len(df) == 0:
-            return {"ok": False, "reason": "行情缓存为空，请先刷新数据", "code": std}
-        sub = df[df["code"] == std].sort_values("date")
-        if len(sub) == 0:
-            return {"ok": False, "reason": f"本地无 {std} 的日线数据", "code": std}
+            return {"ok": False, "reason": "本地行情缓存为空，请先点『刷新数据』", "rows": []}
 
-        full = sub
-        tail_n = max(30, int(bars))
-        sub = full.tail(tail_n)
+        want = set(codes)
+        cats = df["code"].cat.categories
+        cat_ok = np.fromiter(
+            (c in want for c in cats), dtype=bool, count=len(cats)
+        )
+        idx = self._rows_in_window(np.array([anchor], dtype="int32"), cat_ok)
+        ma_window = int(params.get("ma_window") or 20)
+        work = self._attach_volume_stats(idx, ma_window)
+        if len(work) == 0:
+            base["reason"] = f"{ymd_to_iso(anchor)} 该板块没有成分股行情"
+            return base
 
+        lim = self._anchor_limits(anchor)
+        names_map = {c: self.names.get(c) or "" for c in work["code"].unique()}
+        ind_map = {c: self.industries.get_l2(c) for c in work["code"].unique()}
+        share_map = {c: self.shares.get(c) for c in work["code"].unique()}
+        concept_n = {c: len(self.concepts.get(c)) for c in work["code"].unique()}
+
+        out: List[Dict[str, Any]] = []
+        for r in work.itertuples(index=False):
+            code = str(r.code)
+            close = float(r.close)
+            fs = share_map.get(code)
+            limv = lim.get(code, 0)
+            out.append(
+                {
+                    "code": code,
+                    "symbol": split_code(code)[0],
+                    "name": names_map.get(code),
+                    "board": board_of(code),
+                    "industry_l2": ind_map.get(code),
+                    "close": round(close, 3),
+                    "pct": None if pd.isna(r.pct) else round(float(r.pct), 5),
+                    "amount_yi": fmt_amount_yi(float(r.amount)),
+                    "volume_hand": round(float(r.volume) / 100.0, 0),
+                    "vol_ratio": None if pd.isna(r.vol_ratio) else round(float(r.vol_ratio), 3),
+                    "ma_volume": round(float(r.ma_vol) / 100.0, 0) if pd.notna(r.ma_vol) else None,
+                    "turnover": (
+                        round(float(r.volume) / float(fs), 5) if fs else None
+                    ),
+                    "float_mcap_yi": (
+                        round(float(fs) * close / 1e8, 2) if fs else None
+                    ),
+                    "concept_n": concept_n.get(code, 0),
+                    "limit": "涨停" if limv == 1 else ("跌停" if limv == -1 else ""),
+                }
+            )
+
+        key = str(params.get("sort") or "pct")
+        cols = {
+            "code": lambda r: r["symbol"],
+            "name": lambda r: r["name"] or "",
+            "pct": lambda r: r["pct"],
+            "close": lambda r: r["close"],
+            "amount_yi": lambda r: r["amount_yi"],
+            "vol_ratio": lambda r: r["vol_ratio"],
+            "turnover": lambda r: r["turnover"],
+            "float_mcap_yi": lambda r: r["float_mcap_yi"],
+            "industry_l2": lambda r: r["industry_l2"] or "",
+            "concept_n": lambda r: r["concept_n"],
+        }
+        if key not in cols:
+            key = "pct"
+        getter = cols[key]
+        order = str(params.get("order") or "desc")
+        text_key = key in ("code", "name", "industry_l2")
+        # 文本列一律升序（「涨停」排在「跌停」前面这种默认），数字列按请求方向
+        out = self._sorted_rows(out, key, order == "desc" and not text_key, getter)
+        total = len(out)
+        limit = int(params.get("limit") or 0)
+        if limit > 0:
+            out = out[:limit]
+
+        base.update(
+            {
+                "n_quoted": total,
+                "n_limit_up": sum(1 for r in out if r["limit"] == "涨停"),
+                "n_limit_down": sum(1 for r in out if r["limit"] == "跌停"),
+                "n_suspended": max(0, len(codes) - total),
+                "count": len(out),
+                "sort": key,
+                "order": order,
+                "elapsed": round(time.perf_counter() - t_start, 3),
+                "rows": out,
+            }
+        )
+        return base
+
+    def index_kline(self, index_code: str, bars: int = 160) -> Dict[str, Any]:
+        """板块指数 K 线（含均线、均量、MACD）。"""
+        ic = str(index_code).strip()
+        info = self.boards.get(ic)
+        if info is None:
+            return {"ok": False, "reason": f"未知板块 {ic}", "code": ic}
+        n = max(30, int(bars))
+        full = self._index_bars(ic, tail=n + 70)
+        if full is None or len(full) == 0:
+            return {"ok": False, "reason": f"本地没有板块指数 {ic} 的日线数据", "code": ic}
+        payload = self._kline_payload(full, n, self._default_ma_window())
+        payload.update(
+            {
+                "code": ic,
+                "name": info["name"],
+                "category": info["category"],
+                "is_index": True,
+                "n_members": info["n"],
+            }
+        )
+        return payload
+
+    def _default_ma_window(self) -> int:
+        return int(self.config.section("screen").get("ma_window", 20) or 20)
+
+    def _kline_payload(
+        self, full: pd.DataFrame, bars: int, ma_window: int
+    ) -> Dict[str, Any]:
+        """把一段按日期升序的日线整理成前端 K 线图要用的载荷。
+
+        个股与板块指数共用（两个图除了数据来源不同，形态要求完全一致：
+        主图 + 成交量 + MACD）。
+        """
+        sub = full.tail(max(30, int(bars)))
         closes = full["close"].astype("float64")
         volumes = full["volume"].astype("float64")
         mas: Dict[str, List[Optional[float]]] = {}
@@ -1772,24 +2341,23 @@ class MarketService:
             for o, c, l, h in zip(sub["open"], sub["close"], sub["low"], sub["high"])
         ]
         vols = [round(float(v) / 100.0, 0) for v in sub["volume"]]  # 手
-        ratios = [None if pd.isna(v) else round(float(v), 2) for v in vol_ratio_series.tail(len(sub))]
+        ratios = [
+            None if pd.isna(v) else round(float(v), 2)
+            for v in vol_ratio_series.tail(len(sub))
+        ]
         ma_volume = [
             None if pd.isna(v) else round(float(v) / 100.0, 0)
             for v in ma_vol_series.tail(len(sub))
         ]
-        pct = [None if pd.isna(v) else round(float(v), 5) for v in sub["pct"]]
+        pct = [None if pd.isna(v) else round(float(v), 5) for v in sub["pct"]] if "pct" in sub else [None] * len(sub)
 
         signals = [
             {"date": d, "index": i, "vol_ratio": r}
             for i, (d, r) in enumerate(zip(dates, ratios))
             if r is not None and r >= 2.0
         ]
-
-        # 叠加已保存的计划/追踪价位
         return {
             "ok": True,
-            "code": std,
-            "name": self.names.get(std),
             "bars": len(sub),
             "dates": dates,
             "ohlc": ohlc,
@@ -1798,12 +2366,56 @@ class MarketService:
             "vol_ratio": ratios,
             "pct": pct,
             "ma": mas,
+            "macd": self._macd(closes, tail=len(sub)),
             "signals": signals,
             "latest": {
                 "date": dates[-1] if dates else None,
                 "close": round(float(sub["close"].iloc[-1]), 3),
             },
         }
+
+    @staticmethod
+    def _macd(
+        closes: pd.Series,
+        fast: int = 12,
+        slow: int = 26,
+        signal: int = 9,
+        tail: int = 0,
+    ) -> Dict[str, List[Optional[float]]]:
+        """MACD(12, 26, 9)，与通达信 / 同花顺默认口径一致。
+
+        ``dif = EMA12 − EMA26``、``dea = EMA9(dif)``、柱 = ``2 × (dif − dea)``
+        （通达信的柱状图是两倍，不是常见的 1 倍）；取 ``tail`` 根与 K 线对齐。
+        """
+        c = pd.Series(closes).astype("float64").reset_index(drop=True)
+        if len(c) == 0:
+            return {"dif": [], "dea": [], "macd": []}
+        ema_fast = c.ewm(span=fast, adjust=False).mean()
+        ema_slow = c.ewm(span=slow, adjust=False).mean()
+        dif = ema_fast - ema_slow
+        dea = dif.ewm(span=signal, adjust=False).mean()
+        bar = (dif - dea) * 2.0
+        pick = (lambda s: s.tail(int(tail))) if tail else (lambda s: s)
+        r4 = lambda s: [None if pd.isna(v) else round(float(v), 4) for v in pick(s)]
+        return {"dif": r4(dif), "dea": r4(dea), "macd": r4(bar)}
+
+    def kline(self, code: str, bars: int = 160, ma_window: int = 20) -> Dict[str, Any]:
+        """返回单只股票的 K 线（含均线、均量、放量标记与 MACD）。
+
+        载荷的组装与板块指数共用 :meth:`_kline_payload`，两者的图形结构因此
+        完全一致（主图 + 成交量 + MACD），前端一套渲染即可。
+        """
+        std = normalize_code(code)
+        df = self.bars()
+        if len(df) == 0:
+            return {"ok": False, "reason": "行情缓存为空，请先刷新数据", "code": std}
+        full = df[df["code"] == std].sort_values("date")
+        if len(full) == 0:
+            return {"ok": False, "reason": f"本地无 {std} 的日线数据", "code": std}
+        # 买卖价标记由前端叠加（抽屉里有输入框，见 app.js::loadKline）
+        payload = self._kline_payload(full, bars, ma_window)
+        payload.update({"code": std, "name": self.names.get(std)})
+        return payload
 
     # ------------------------------------------------------------------
     # 追踪估值
