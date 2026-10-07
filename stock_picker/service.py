@@ -2678,7 +2678,9 @@ class MarketService:
         ]
         # 偏离度附图要用前复权因子把 close/amount/volume 统一折算
         # （行情缓存三列都是不复权；因子在跨除权日时才起作用）。
-        bias = self._bias(full, factor=self._div_factor_series(sub), tail=len(sub))
+        factor = self._div_factor_series(sub)
+        bias = self._bias(full, factor=factor, tail=len(sub))
+        bias_ma = self._bias_ma(full, factor=factor, tail=len(sub))
         return {
             "ok": True,
             "bars": len(sub),
@@ -2691,6 +2693,7 @@ class MarketService:
             "ma": mas,
             "macd": self._macd(closes, tail=len(sub)),
             "bias": bias,
+            "bias_ma": bias_ma,
             "signals": signals,
             "latest": {
                 "date": dates[-1] if dates else None,
@@ -2790,6 +2793,91 @@ class MarketService:
             "m20": pick(m20),
             "window": int(window),
             "adjusted": factor is not None,
+        }
+
+    @staticmethod
+    def _bias_ma(full: pd.DataFrame, factor: Optional[List[float]] = None,
+                 tail: int = 0) -> Dict[str, Any]:
+        """「量能均线乖离」附图（对应通达信公式，见 README §2.4.2）。
+
+        通达信原式（``N1=5 / N2=10 / N3=20 / N4=60``）::
+
+            FQ    := DIVFACTOR(1) / CONST(DIVFACTOR(1));
+            MA5   := SUM(AMOUNT*FQ, N1) / SUM(VOL, N1) / 100;
+            MA10  := SUM(AMOUNT*FQ, N2) / SUM(VOL, N2) / 100;
+            MA20  := SUM(AMOUNT*FQ, N3) / SUM(VOL, N3) / 100;
+            MA60  := SUM(AMOUNT*FQ, N4) / SUM(VOL, N4) / 100;
+            MAXVS := MAX(MAX(MA5,MA10),MA20);
+            MINVS := MIN(MIN(MA5,MA10),MA20);
+            TMP   := IF(MA60>=MAXVS, MINVS, MAXVS);   -- 原式算出后未被引用
+            T     := ((MA20-REF(MA20,1)) >= 0);
+            GLD   := (MAXVS-MINVS)/MINVS*100;
+            GLXS  : IF(T, GLD, -GLD), COLORSTICK;
+            GL20  := (CLOSE-MA20)/CLOSE*100;
+            SMOOTHGL20 : MA(GL20,3);
+            5 / 0 / -5 三条虚线
+
+        含义：``MA5/10/20`` 是不同周期的**成交额加权均价**（VWAP），
+        ``GLXS`` 是它们的极差（相对最小值的百分比，即「量能均线乖离率」）——
+        短周期均价在长周期上方取正、下方取负，是一个**由 ``MA20`` 斜率定号
+        的柱状图**；``GL20`` 是收盘价相对 ``MA20`` 的偏离百分比，``SMOOTHGL20``
+        是它的 3 日简单移动平均。
+
+        **复权因子不可省**（同 :meth:`_bias`）：缓存三列都是不复权原始值，
+        跨除权日直接算 ``SUM(amount)/SUM(volume)`` 会让 ``MA5/10/20/60`` 与
+        ``gl20`` 在除权日假跳空。
+
+        **量纲**：通达信 ``VOL`` 以「手」计、``AMOUNT`` 以「元」计，
+        故 ``/100`` 才得「元/股」；本项目 ``volume`` 存**股**，
+        ``amount/volume`` **已是元/股，不再除 100**（同 :meth:`_bias`）。
+
+        窗口**不设** ``min_periods``：长历史票前 4 根 ``MA5`` 仍可算，
+        ``glxs`` 只在 ``MA5/10/20`` 三者都有效时才给值（否则 ``None``），
+        这样既不丢早期数据、也不会画出错线。
+        """
+        n = len(full)
+        blank = {"glxs": [None] * tail, "gl20": [None] * tail,
+                 "smooth": [None] * tail, "ma20": [None] * tail,
+                 "adjusted": factor is not None}
+        if n == 0 or "amount" not in full or "volume" not in full:
+            return blank
+        amt = full["amount"].astype("float64")
+        vol = full["volume"].astype("float64")
+        closes = full["close"].astype("float64")
+
+        if factor is not None and len(factor) == n:
+            f = pd.Series(factor, index=full.index, dtype="float64")
+            closes = closes * f
+            vol = vol / f.replace(0.0, pd.NA).astype("float64")
+
+        def vwap(w: int) -> pd.Series:
+            return (amt.rolling(int(w)).sum()
+                    / vol.rolling(int(w)).sum()).replace([np.inf, -np.inf], np.nan)
+
+        ma5, ma10, ma20, ma60 = vwap(5), vwap(10), vwap(20), vwap(60)
+        maxvs = pd.concat([ma5, ma10, ma20], axis=1).max(axis=1)
+        minvs = pd.concat([ma5, ma10, ma20], axis=1).min(axis=1)
+        span = maxvs - minvs
+        # 三者中任一无效 -> glxs 无效（避免用「只有 3 个点的均值」冒充）
+        valid = ma5.notna() & ma10.notna() & ma20.notna() & (minvs.abs() > 1e-12)
+        sign = (ma20 - ma20.shift(1)) >= 0
+        glxs = span / minvs.replace(0.0, np.nan) * 100.0
+        glxs = glxs.where(sign, -glxs).where(valid)
+
+        gl20 = ((closes - ma20) / closes) * 100.0
+        smooth = gl20.rolling(3).mean()   # MA(GL20,3)，SMA 不是 EMA
+
+        def pick(s: pd.Series) -> List[Optional[float]]:
+            s = s.tail(int(tail)) if tail else s
+            return [None if pd.isna(v) else round(float(v), 4) for v in s]
+
+        return {
+            "glxs": pick(glxs),
+            "gl20": pick(gl20),
+            "smooth": pick(smooth),
+            "ma20": pick(ma20),
+            "adjusted": factor is not None,
+            "ma60_above": pick(ma60.where(ma60 >= maxvs)),
         }
 
     @staticmethod

@@ -706,6 +706,10 @@
           <input type="checkbox" id="klineBiasOn" checked />
           偏离度
         </label>
+        <label class="inline" title="量能均线乖离 = MA5/10/20 三个成交额加权均价的极差百分比（MA20 上行取正、下行取负）；GL20 = (收盘 − MA20)/收盘 × 100%，SMOOTH 为其 3 日均线（按前复权口径计算）">
+          <input type="checkbox" id="klineBiasMaOn" checked />
+          量能乖离
+        </label>
         <button class="btn small" id="btnKlineReload">重载</button>
         <button class="btn small" id="btnDrawerClose">关闭</button>
       </div>

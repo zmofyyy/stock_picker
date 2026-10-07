@@ -474,11 +474,17 @@ label.inline input:focus { outline: none; border-color: var(--accent); }
 .drawer-body { flex: 1; overflow: auto; padding: 14px 18px 26px; }
 .chart { width: 100%; height: 420px; }
 .chart.tall { height: 620px; }
-/* 抽屉里的个股 K 线：带「偏离度」附图时多一栏，需要更高的画布。
-   高度改由 JS 切 .with-bias 控制（见 app.js::loadKline）——ECharts 按容器
-   实际像素算 grid，容器矮了最下面那栏会被裁掉。
-   640 与 app.js 里三栏 grid 的 top/height 是配套的，改一处要改两处。 */
-#klineChart.tall.with-bias { height: 640px; }
+/* 抽屉里的个股 K 线：附图切换时画布高度要跟着栏数变，否则 ECharts 按容器
+   实际像素算 grid，**容器矮了最下面那栏会被静默裁掉**。
+   高度由 JS 切类名控制（见 app.js::loadKline），三档：
+     .with-bias                     620 -> 640   加「偏离度」
+     .with-bias-ma                  620 -> 640   加「量能乖离」
+     .with-bias.with-bias-ma        620 -> 840   两栏都加（4 栏，主图留够空间）
+   这里的 640 / 840 与 app.js 里动态算 grid 的 MAIN_FRAC 是配套的，
+   **改一处要改两处**。 */
+#klineChart.tall.with-bias,
+#klineChart.tall.with-bias-ma { height: 640px; }
+#klineChart.tall.with-bias.with-bias-ma { height: 840px; }
 .chart.small { height: 180px; margin-top: 8px; }
 
 .plan-bar {

@@ -138,19 +138,44 @@
 - **下拉只显示 `显示名 · 成员数`**（不拼 `.blk` 后缀、不重复文件名），成员数 0 的置灰不可选；条件栏**只有显示名 ≠ 文件名时**才补 `（JXJC_CX）`。
 - 回归 `packaging/watchblock_test.py`（**9 节**，含**动态扫描**；用 `tempfile` 造假 TDX 根目录，**绝不碰真实目录**）：`STOCK_PICKER_HOME=<独立HOME> C:\Python313\python.exe packaging/watchblock_test.py`。
 
-## 13. 复权因子与偏离度附图（`divfactor.py`）
+## 13. 复权因子与两个附图（`divfactor.py`）
 
 - **⚠️ 最重要的一条事实**：本项目行情缓存 `close` / `amount` / `volume` **三列全部是不复权原始值、同尺度**。证据 = 全市场 20 万条抽样 `close ÷ (amount/volume)` **中位数 1.0001 / 99.97% 落在 [0.9,1.1]**；铁证 `000002.SZ` 2003-05-23 `close` 13.81→6.79 腰斩而 `amount` 1.536亿→1.619亿**不跳变**。
   **别再用单只股票或某个时间段的比值去推口径**（我连错三次：先猜「前复权可省 FQ」，再因 600000 近期比值≈1 误判，最后把 close 腰斩当「前复权证据」反了方向）。要下结论就**全市场大样本 + 看分布**。
-- **`FQ` 不可省**（用户明确纠偏）：跨除权日算 250 日 `Σamount/Σvolume` 会把两种价位尺度混合 → `T` 假跳空。实测 `000002` 2003-05-23 **复权 +11.48% vs 不复权 −77.46%**（差 88 个百分点）。
+- **`FQ` 不可省**（用户明确纠偏）：跨除权日算 `Σamount/Σvolume` 会把两种价位尺度混合 → 假跳空。偏离度 `T`：`000002` 2003-05-23 **复权 +11.48% vs 不复权 −77.46%**（差 88 点）；量能乖离 `GL20` 最大差 **90.9 点**。
 - **数据源** `T0002/hq_cache/gbbq` → `GbbqReader().get_df()` 8 列。**`category==1` = 除权除息**（65810 条/6284 只），四列**每 10 股口径**；`category==5` = 股本变化（`shares.py` 已用，别混）。
 - **前复权因子（直接式，无需递推）**：`ratio = 1+(songgu+peigu)/10`；`f = [1−(hongli/10 − peigujia*peigu/10)/P_raw(前一日)]/ratio`；`F(t)` = `t` **之后**所有除权日 `f` 连乘（最新一日恒 1.0）。**第一版误写成递推式（依赖 f_next），重构为直接式才对。**
 - **三列折算（用户选定前复权）**：`P_adj = P_raw × F`、**`AMOUNT_adj = AMOUNT`（钱不折）**、`VOL_adj = VOL / F`。
 - **量纲差异（最易错）**：通达信 `VOL` 是**手**、`AMOUNT` 是**元** → 原式 `/100` 把元/手换成元/股；**本项目 `volume` 是「股」，故 `amount/volume` 已是元/股、不再除 100**（`本项目 = 通达信 VOL × 100`，`/100` 恰好抵消）。
 - 索引缓存 `data/div_factors.json`；事件表**定点化存 ×1000 整数**（绕开 JSON 浮点尾巴）；`PARSE_VERSION` 改动要 +1；`load()` 降级为空索引不抛异常，`refresh()` = `load(force=False)`。
-- `_bias(full, factor=None, tail=0, window=250)`：`t` 用 `ewm(span=3/20, adjust=False)`（**等价 `EMA(T,3)` / `EMA(T,20)`**）；窗口不足处为 `None`；`adjusted` 标记是否有除权事件。
-- 回归 `packaging/divfactor_test.py` **8 节**：前提同口径 / 事件表核对 / 抹平跳空 / 单步公式 / 无事件股因子恒 1 / T 不假跳空 / 内部一致性 / 量纲。
-- **前端三处必须同步改**（否则最下栏**静默裁掉**）：`style.css` `#klineChart.tall.with-bias{height:640px}`（原 620）、`app.js` 三栏 `grid`（296/108/138）、`showBias` 计算（**必须先定义再用**）。关掉回落 620 两栏 + `dataZoom.xAxisIndex` 变 `[0,1]`。
+- **`_kline_payload` 里因子只算一次**（`factor = self._div_factor_series(sub)`），`_bias` 与 `_bias_ma` 共用 —— 别各自算一遍。
+
+### 附图一：偏离度 `_bias`（`T` / `M5` / `M20`，窗口 250）
+
+- `t` 用 `ewm(span=3/20, adjust=False)`（**等价 `EMA(T,3)` / `EMA(T,20)`**）；窗口不足处为 `None`；`adjusted` 标记是否有除权事件。
+- payload 字段：`ma250 / t / m5 / m20 / window / adjusted`。
+
+### 附图二：量能乖离 `_bias_ma`（`GLXS` / `GL20` / `SMOOTH`，N=5/10/20/60）
+
+- `MA5/10/20/60` = 成交额加权均价（VWAP）。`GLXS` = `(max(MA5,MA10,MA20) − min(...)) / min(...) * 100`，**符号由 `MA20` 斜率定**（`MA20 >= REF(MA20,1)` 取正、否则取负）。
+- **⚠️ `GLXS 与 GL20 是两条不同的线**，别当成「偏离度换窗口」。`GL20 = (close − MA20)/close×100`。
+- **`SMOOTH = MA(GL20,3)` 是简单均线**（`rolling(3).mean()`），**不是 EMA** —— 极易写错成 `ewm`。
+- **符号项是灵魂**：写成 `abs()` 或忘了置号 → 柱全在 0 上方。回归用 **6013 点逐点核对 + 0 处不符** 钉住，另验「正负都出现」（实测 3044 正 / 2969 负）。
+- **窗口不设 `min_periods`**：`MA5` 最前几根也能算，但 `GLXS` 只在 `MA5/10/20` 三者都有效时给值（否则 `None`）→ 既不少画也不硬画。
+- payload 字段：`glxs / gl20 / smooth / ma20 / ma60_above / adjusted`。`ma60_above` = 原式 `TMP` 的条件（`MA60 ≥ maxVS`），**只作交叉核对，前端不画**。
+- 原式 `TMP := IF(MA60>=MAXVS, MINVS, MAXVS)` **定义后从未被引用 = 死代码**，不实现。
+
+### 回归与前端（改这里必看）
+
+- `packaging/divfactor_test.py` **9 节**（8 节复权/偏离度 + **第九节 16 项量能乖离**）。
+- **⚠️ 前端是「动态栅格」，别手工维护 `grid` 常量**：栏数 2~4 由两个勾选框决定。
+  `paneCount = 2 + showBias + showBiasMa`；`MAIN_FRAC` = 两图都开 0.46 / 3 栏 0.46 / 2 栏 0.58；
+  由 `paneCount` 反推每栏 `top/height`（最后一栏减 24 给 x 轴标签）。
+- **附图栏索引必须动态推导**：`biasPane = showBias?2:-1`、`bmaPane = showBiasMa?(showBias?3:2):-1`。
+  **只开量能乖离时它落在 index 2，不是 3** —— 写死会画到不存在的轴上。
+- **高度三档**（CSS 与 `MAIN_FRAC` 配套，**改一处要改两处**）：`.with-bias` 640 / `.with-bias-ma` 640 / 两者同时 **840**。矮了最下栏**静默裁掉**。
+- **图例名字不能撞**：附图里的成交额加权 MA20 也叫 `"MA20"` 会与主图均线按名字合并 → 用 **`VMA20`**。
+- CDP 实测 4 组合：**840 / 640 / 620 / 640**；`grid=[34+339,387+133,534+133,681+109]`；`dataZoom.xAxisIndex=[0,1,2,3]`。
 
 ## 14. 验证方法论
 

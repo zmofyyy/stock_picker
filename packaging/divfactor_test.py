@@ -223,6 +223,111 @@ check("不复权 ma250 与原始收盘同量级",
 
 print()
 print("=" * 78)
+print("九、_bias_ma：量能均线乖离（GLXS / GL20 / SMOOTHGL20）")
+print("=" * 78)
+# 原文：N1=5 / N2=10 / N3=20 / N4=60
+payload2 = service._kline_payload(sub, 400, 20)
+bm = payload2["bias_ma"]
+check("payload 带 bias_ma 段", isinstance(bm, dict) and "glxs" in bm)
+check("bias_ma.adjusted == True", bm.get("adjusted") is True)
+for key in ("glxs", "gl20", "smooth", "ma20"):
+    check(f"bias_ma.{key} 与 bars 等长",
+          len(bm.get(key) or []) == payload2["bars"],
+          f"{len(bm.get(key) or [])} vs {payload2['bars']}")
+
+bm_adj = service._bias_ma(sub, factor=service._div_factor_series(sub))
+bm_raw = service._bias_ma(sub, factor=None)
+
+# 手工重算：VWAP 窗口 5 / 10 / 20（复权口径）
+vol_adj = pd.Series([v / x for v, x in zip(sub["volume"].astype("float64"), fac)])
+amt_s = sub["amount"].astype("float64")
+def _vwap(w):
+    return amt_s.rolling(w).sum() / vol_adj.rolling(w).sum()
+m5, m10, m20 = _vwap(5), _vwap(10), _vwap(20)
+mx = pd.concat([m5, m10, m20], axis=1).max(axis=1)
+mn = pd.concat([m5, m10, m20], axis=1).min(axis=1)
+g = (mx - mn) / mn * 100.0
+sign = (m20 - m20.shift(1)) >= 0
+glxs_manual = g.where(sign, -g)
+gl20_manual = ((adj_close - m20) / adj_close) * 100.0
+sm_manual = gl20_manual.rolling(3).mean()
+
+check("末根 GL20 与手算一致",
+      bm_adj["gl20"][-1] is not None
+      and abs(bm_adj["gl20"][-1] - float(gl20_manual.iloc[-1])) < 1e-3,
+      f"{bm_adj['gl20'][-1]} vs {float(gl20_manual.iloc[-1]):.4f}")
+check("末根 GLXS 与手算一致",
+      bm_adj["glxs"][-1] is not None
+      and abs(bm_adj["glxs"][-1] - float(glxs_manual.iloc[-1])) < 1e-3,
+      f"{bm_adj['glxs'][-1]} vs {float(glxs_manual.iloc[-1]):.4f}")
+check("末根 SMOOTH 与手算一致（MA(GL20,3) 是简单均线，不是 EMA）",
+      bm_adj["smooth"][-1] is not None
+      and abs(bm_adj["smooth"][-1] - float(sm_manual.iloc[-1])) < 1e-3,
+      f"{bm_adj['smooth'][-1]} vs {float(sm_manual.iloc[-1]):.4f}")
+
+# GLXS 的符号必须与 MA20 斜率一致（这是「T := (MA20-REF(MA20,1))>=0」的语义）
+slope_up = (m20 - m20.shift(1)) >= 0
+bad_sign = 0
+checked_sign = 0
+for i in range(1, len(sub)):
+    v = bm_adj["glxs"][i]
+    if v is None:
+        continue
+    checked_sign += 1
+    if bool(slope_up.iloc[i]) != (v >= 0):
+        bad_sign += 1
+check("GLXS 符号 == MA20 斜率方向（正=上行、负=下行）",
+      checked_sign > 0 and bad_sign == 0,
+      f"checked={checked_sign} mismatched={bad_sign}")
+
+# GLXS 应当正负都出现（否则「取符号」语义没生效；除非该票真的单边）
+gv = [v for v in (bm_adj["glxs"] or []) if v is not None]
+check("GLXS 正负都有（符号项真的在起作用）",
+      any(v > 0 for v in gv) and any(v < 0 for v in gv),
+      f"正={sum(1 for v in gv if v > 0)} 负={sum(1 for v in gv if v < 0)}")
+
+# GL20 与 GLXS 是两个不同的东西（别把两者混为一谈）
+diff_ok = any(
+    bm_adj["glxs"][i] is not None and bm_adj["gl20"][i] is not None
+    and abs(bm_adj["glxs"][i] - bm_adj["gl20"][i]) > 1e-6
+    for i in range(len(sub))
+)
+check("GLXS 与 GL20 不是同一条线", diff_ok)
+
+# 复权 vs 不复权：除权日附近 GL20 会有可见差异
+gap = max(
+    (abs((bm_raw["gl20"][i] or 0) - (bm_adj["gl20"][i] or 0))
+     for i in range(len(sub))
+     if bm_raw["gl20"][i] is not None and bm_adj["gl20"][i] is not None),
+    default=0.0,
+)
+check("复权口径对 GL20 有实质影响（最大差异 > 0.5）", gap > 0.5,
+      f"max|Δ|={gap:.3f}")
+
+# 量纲：附图里的 MA20 应与复权收盘同量级（不是 100 倍）
+ma20_last = bm_adj["ma20"][-1]
+close_last2 = adj_close.iloc[-1]
+check("MA20（成交额加权）与复权收盘同量级（0.3~3）",
+      ma20_last is not None and 0.3 < ma20_last / close_last2 < 3.0,
+      f"ma20={ma20_last:.3f} close={close_last2:.3f}")
+
+# 窗口不足时：前 4 根 MA5 仍应可算（不设 min_periods），但更早处为 None
+check("GLXS 前几根为 None、之后有值（窗口不足不硬画）",
+      bm_adj["glxs"][0] is None and any(v is not None for v in bm_adj["glxs"]),
+      f"first={bm_adj['glxs'][0]}")
+
+# 无复权事件的票 → bias_ma 也正常（因子恒 1），且 adjusted 仍为 True（传了因子）
+if found is not None:
+    g2 = BARS[BARS["code"] == found].sort_values("date")
+    g2 = g2.reset_index(drop=True)
+    if len(g2) > 30:
+        bm0 = service._bias_ma(g2, factor=service._div_factor_series(g2))
+        vv = [v for v in (bm0["gl20"] or []) if v is not None]
+        check(f"{found}（无事件）bias_ma 正常产出", len(vv) > 0,
+              f"n={len(vv)}")
+
+print()
+print("=" * 78)
 if FAILD:
     print(f"FAILED {len(FAILD)} 项：")
     for n in FAILD:

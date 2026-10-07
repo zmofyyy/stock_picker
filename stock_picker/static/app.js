@@ -24,6 +24,11 @@ const C = {
   bias: '#2191ed',
   biasM5: '#ff9f0a',
   biasM20: '#30d158',
+  // 量能乖离附图（原作 COLORSTICK 柱 / COLORYELLOW 平滑线）
+  glxs: '#ff453a',
+  gl20: '#ff9f0a',
+  glSmooth: '#ffd60a',
+  glMa20: '#64d2ff',
 };
 
 const state = {
@@ -33,6 +38,7 @@ const state = {
   current: null,
   klineChart: null,
   klineBias: true,      // 偏离度附图默认显示（抽屉顶部可关）
+  klineBiasMa: true,    // 量能乖离附图默认显示（抽屉顶部可关）
   pollTimer: null,
   industries: [],       // 全部二级行业名
   industryTree: {},     // 一级 -> [二级]
@@ -1948,6 +1954,7 @@ function openDrawer(row) {
   $('#drawerMask').hidden = false;
   // 勾选框是「持久偏好」：每次开抽屉把控件同步回 state，避免关闭过的人再打开时对不上
   $('#klineBiasOn').checked = state.klineBias !== false;
+  $('#klineBiasMaOn').checked = state.klineBiasMa !== false;
   $('#drawerTitle').textContent = `${row.code} ${row.name || ''}`;
   const ind = [row.industry_l1, row.industry_l2, row.industry_l3].filter(Boolean).join(' / ');
   const cpts = row.concepts || [];
@@ -2006,6 +2013,11 @@ function openDrawer(row) {
     state.klineBias = !!e.target.checked;
     loadKline();
   };
+  // 量能乖离附图开关，同上
+  $('#klineBiasMaOn').onchange = (e) => {
+    state.klineBiasMa = !!e.target.checked;
+    loadKline();
+  };
   loadKline();
 }
 
@@ -2034,13 +2046,41 @@ async function loadKline() {
   const bias = d.bias || {};
   const showBias = !!(bias.t && bias.t.some((v) => v != null)) && state.klineBias !== false;
 
+  /* 量能乖离附图（对应通达信公式）：GLXS 柱（MA5/10/20 极差乖离，MA20 斜率定号）、
+     GL20 收盘对 MA20 的偏离、SMOOTHGL20 为其 3 日均线。同样由后端按前复权口径算。 */
+  const bma = d.bias_ma || {};
+  const showBiasMa = !!(bma.gl20 && bma.gl20.some((v) => v != null)) && state.klineBiasMa !== false;
+
   if (!state.klineChart) state.klineChart = echarts.init($('#klineChart'));
   const chart = state.klineChart;
   // 附图开关会改变栅格布局：容器高度必须跟着变，否则 ECharts 算出来的
-  // grid 会超出画布（表现为最下面那栏被裁掉）。改完 class 先 resize，
+  // grid 会超出画布（表现为最下面那栏被裁掉，是**静默失败**）。
+  // 三个类名与 CSS 的高度档位一一对应（620 / 640 / 640 / 800）。改完先 resize，
   // setOption 之后还会再 resize 一次。
-  $('#klineChart').classList.toggle('with-bias', showBias);
+  const el = $('#klineChart');
+  el.classList.toggle('with-bias', showBias);
+  el.classList.toggle('with-bias-ma', showBiasMa);
   chart.resize();
+
+  /* 栅格随附录数量动态生成。参数与要画的栏数绑定，**别再手工维护一份 grid**：
+     栏数 2~4，顶部从 34 起，栏间留 14px，dataZoom 滑块占底部 ~26px。 */
+  const H = el.getBoundingClientRect().height || 620;
+  const paneCount = 2 + (showBias ? 1 : 0) + (showBiasMa ? 1 : 0);
+  const GAP = 14, TOP0 = 34, BOTTOM = 26, AXIS_H = 24;
+  // 主图分到的比例更高一些（看 K 线是主线）；两个附图等分其余空间。
+  // 4 栏时 840 画布 → 主图 ~339px、两个附图各 ~133px（配 CSS 的 840）。
+  const MAIN_FRAC = (showBias && showBiasMa) ? 0.46 : (paneCount === 3 ? 0.46 : 0.58);
+  const availH = H - TOP0 - BOTTOM - GAP * (paneCount - 1);
+  const mainH = Math.round(availH * MAIN_FRAC);
+  const otherH = Math.round((availH - mainH) / (paneCount - 1));
+  const grids = [];
+  let gtop = TOP0;
+  for (let i = 0; i < paneCount; i++) {
+    const isLast = i === paneCount - 1;
+    const h = i === 0 ? mainH : (isLast ? otherH - AXIS_H : otherH);
+    grids.push({ left: 58, right: 26, top: gtop, height: Math.max(40, h) });
+    gtop += (i === 0 ? mainH : otherH) + GAP;
+  }
 
   const volColors = d.ohlc.map((o) => (o[1] >= o[0] ? UP : DOWN));
   const signalIdx = (d.signals || []).map((s) => s.index);
@@ -2068,6 +2108,11 @@ async function loadKline() {
     style: { text: `卖出 ${fmt(sell)}`, fill: UP, font: '11px -apple-system, "PingFang SC", sans-serif' },
   });
 
+  /* 附图栏的索引由「开关组合」决定，不能写死 2：
+     没有 偏离度 时，量能乖离就落到第 2 栏。 */
+  const biasPane = showBias ? 2 : -1;
+  const bmaPane = showBiasMa ? (showBias ? 3 : 2) : -1;
+
   const option = {
     animation: false,
     backgroundColor: 'transparent',
@@ -2075,9 +2120,9 @@ async function loadKline() {
     legend: {
       top: 4, left: 8, itemGap: 14,
       textStyle: { color: C.muted }, inactiveColor: '#48484a',
-      data: showBias
-        ? ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '20日均量', 'T', 'M5', 'M20']
-        : ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '20日均量'],
+      data: ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '20日均量']
+        .concat(showBias ? ['T', 'M5', 'M20'] : [])
+        .concat(showBiasMa ? ['GLXS', 'GL20', 'SMOOTH', 'VMA20'] : []),
     },
     tooltip: {
       trigger: 'axis', axisPointer: { type: 'cross' },
@@ -2099,6 +2144,14 @@ async function loadKline() {
           extra = `<br/>偏离度 <b style="color:${tc}">${tv == null ? '—' : tv.toFixed(2) + '%'}</b>　`
             + `M5 ${m5v == null ? '—' : m5v.toFixed(2)}　M20 ${m20v == null ? '—' : m20v.toFixed(2)}`;
         }
+        if (showBiasMa) {
+          const gx = (bma.glxs || [])[i];
+          const g20 = (bma.gl20 || [])[i];
+          const sm = (bma.smooth || [])[i];
+          const gxc = gx == null ? C.muted : (gx >= 0 ? UP : DOWN);
+          extra += `<br/>量能乖离 <b style="color:${gxc}">${gx == null ? '—' : gx.toFixed(2) + '%'}</b>　`
+            + `GL20 ${g20 == null ? '—' : g20.toFixed(2)}　平滑 ${sm == null ? '—' : sm.toFixed(2)}`;
+        }
         return `<b>${d.dates[i]}</b><br/>开 ${fmt(h[0])}　高 ${fmt(h[3])}<br/>低 ${fmt(h[2])}　收 <b style="color:${c}">${fmt(h[1])}</b><br/>`
           + `涨跌 <span style="color:${c}">${chg.toFixed(2)}%</span><br/>`
           + `量 ${fmtInt(d.volume[i])} 手　均量 ${fmtInt(d.volume_ma[i])} 手<br/>`
@@ -2107,84 +2160,47 @@ async function loadKline() {
     },
     axisPointer: { link: [{ xAxisIndex: 'all' }] },
     graphic: priceLabels.length ? priceLabels : undefined,
-    grid: showBias ? [
-      // 三栏：主图 / 成交量 / 偏离度。总高 640（CSS #klineChart.with-bias），
-      // 底部留 ~26px 给 dataZoom 滑块。
-      { left: 58, right: 26, top: 34, height: 296 },
-      { left: 58, right: 26, top: 344, height: 108 },
-      { left: 58, right: 26, top: 466, height: 138 },
-    ] : [
-      { left: 58, right: 26, top: 34, height: 330 },
-      { left: 58, right: 26, top: 400, height: 140 },
-    ],
-    xAxis: showBias ? [
-      {
-        type: 'category', data: d.dates, gridIndex: 0, boundaryGap: true,
-        axisLine: { lineStyle: { color: C.line } }, axisLabel: { show: false },
-        splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
-      },
-      {
-        type: 'category', data: d.dates, gridIndex: 1, boundaryGap: true,
-        axisLine: { lineStyle: { color: C.line } }, axisLabel: { show: false },
-        splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
-      },
-      {
-        type: 'category', data: d.dates, gridIndex: 2, boundaryGap: true,
+    grid: grids,
+    // 每个栅格一个 category 轴，只有**最后一栏**显示日期标签（其余留白，
+    // 免得 4 栏都挤一行日期）；dataZoom 联动全部轴。
+    xAxis: grids.map((_, gi) => {
+      const last = gi === grids.length - 1;
+      return {
+        type: 'category', data: d.dates, gridIndex: gi, boundaryGap: true,
         axisLine: { lineStyle: { color: C.line } },
-        axisLabel: { color: C.muted, formatter: (v) => v.slice(5) },
+        axisLabel: last
+          ? { color: C.muted, formatter: (v) => v.slice(5) }
+          : { show: false },
         splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
-      },
-    ] : [
-      {
-        type: 'category', data: d.dates, gridIndex: 0, boundaryGap: true,
-        axisLine: { lineStyle: { color: C.line } }, axisLabel: { show: false },
-        splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
-      },
-      {
-        type: 'category', data: d.dates, gridIndex: 1, boundaryGap: true,
-        axisLine: { lineStyle: { color: C.line } },
-        axisLabel: { color: C.muted, formatter: (v) => v.slice(5) },
-        splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
-      },
-    ],
-    yAxis: showBias ? [
-      {
-        scale: true, gridIndex: 0, splitLine: { lineStyle: { color: C.grid } },
-        axisLabel: { color: C.muted }, axisLine: { show: false },
-        min: (v) => axisSpan(v).lo,
-        max: (v) => axisSpan(v).hi,
-      },
-      {
-        gridIndex: 1, splitLine: { show: false }, axisLabel: { color: C.muted, showMaxLabel: false },
-        axisLine: { show: false }, axisTick: { show: false },
-      },
-      {
-        // 偏离度：带正负号的百分比，轴标加 '%'
-        scale: true, gridIndex: 2, splitLine: { lineStyle: { color: C.grid } },
+      };
+    }),
+    // y 轴：0 号是主图价格轴（纳入买卖价）；成交量轴不带标签；两个附图轴
+    // 都是「带符号百分比」，轴标加 '%'。
+    yAxis: grids.map((_, gi) => {
+      if (gi === 0) {
+        return {
+          scale: true, gridIndex: 0, splitLine: { lineStyle: { color: C.grid } },
+          axisLabel: { color: C.muted }, axisLine: { show: false },
+          min: (v) => axisSpan(v).lo,
+          max: (v) => axisSpan(v).hi,
+        };
+      }
+      if (gi === 1) {
+        return {
+          gridIndex: 1, splitLine: { show: false },
+          axisLabel: { color: C.muted, showMaxLabel: false },
+          axisLine: { show: false }, axisTick: { show: false },
+        };
+      }
+      return {
+        scale: true, gridIndex: gi, splitLine: { lineStyle: { color: C.grid } },
         axisLabel: { color: C.muted, formatter: (v) => `${fmt(v, 0)}%` },
         axisLine: { show: false }, axisTick: { show: false },
-      },
-    ] : [
-      {
-        scale: true, gridIndex: 0, splitLine: { lineStyle: { color: C.grid } },
-        axisLabel: { color: C.muted }, axisLine: { show: false },
-        min: (v) => axisSpan(v).lo,
-        max: (v) => axisSpan(v).hi,
-      },
-      {
-        gridIndex: 1, splitLine: { show: false }, axisLabel: { color: C.muted },
-        axisLine: { show: false }, axisTick: { show: false },
-      },
-    ],
-    dataZoom: showBias ? [
-      { type: 'inside', xAxisIndex: [0, 1, 2], start: 40, end: 100 },
-      { type: 'slider', xAxisIndex: [0, 1, 2], bottom: 4, height: 16, start: 40, end: 100,
-        borderColor: C.line, fillerColor: 'rgba(10,132,255,.16)',
-        handleStyle: { color: C.accent }, moveHandleStyle: { color: C.accent },
-        dataBackground: { lineStyle: { color: C.line }, areaStyle: { color: C.grid } } },
-    ] : [
-      { type: 'inside', xAxisIndex: [0, 1], start: 40, end: 100 },
-      { type: 'slider', xAxisIndex: [0, 1], bottom: 4, height: 16, start: 40, end: 100,
+      };
+    }),
+    dataZoom: [
+      { type: 'inside', xAxisIndex: grids.map((_, gi) => gi), start: 40, end: 100 },
+      { type: 'slider', xAxisIndex: grids.map((_, gi) => gi), bottom: 4, height: 16, start: 40, end: 100,
         borderColor: C.line, fillerColor: 'rgba(10,132,255,.16)',
         handleStyle: { color: C.accent }, moveHandleStyle: { color: C.accent },
         dataBackground: { lineStyle: { color: C.line }, areaStyle: { color: C.grid } } },
@@ -2224,7 +2240,7 @@ async function loadKline() {
           // 偏离度主体线：T = (close - MA250)/close*100
           // 用 0 轴虚线做基准（对应原公式 `0,,DOTLINE,COLOR2191ED`），
           // 线在 0 上方=价格高于长期成交额加权成本，下方=低于。
-          name: 'T', type: 'line', data: bias.t, xAxisIndex: 2, yAxisIndex: 2,
+          name: 'T', type: 'line', data: bias.t, xAxisIndex: biasPane, yAxisIndex: biasPane,
           showSymbol: false, lineStyle: { width: 1.6, color: C.bias },
           itemStyle: { color: C.bias },
           markLine: {
@@ -2234,12 +2250,47 @@ async function loadKline() {
           },
         },
         {
-          name: 'M5', type: 'line', data: bias.m5, xAxisIndex: 2, yAxisIndex: 2,
+          name: 'M5', type: 'line', data: bias.m5, xAxisIndex: biasPane, yAxisIndex: biasPane,
           showSymbol: false, lineStyle: { width: 1, color: C.biasM5 }, itemStyle: { color: C.biasM5 },
         },
         {
-          name: 'M20', type: 'line', data: bias.m20, xAxisIndex: 2, yAxisIndex: 2,
+          name: 'M20', type: 'line', data: bias.m20, xAxisIndex: biasPane, yAxisIndex: biasPane,
           showSymbol: false, lineStyle: { width: 1.2, color: C.biasM20 }, itemStyle: { color: C.biasM20 },
+        },
+      ] : []),
+      ...(showBiasMa ? [
+        {
+          // GLXS：MA5/10/20 三个成交额加权均价的极差乖离，MA20 上行取正、下行取负
+          // （原式 COLORSTICK 柱）。用「涨红跌绿」上色：柱在 0 上=红、下=绿。
+          name: 'GLXS', type: 'bar', data: bma.glxs, xAxisIndex: bmaPane, yAxisIndex: bmaPane,
+          itemStyle: { color: (p) => (p.value >= 0 ? UP : DOWN) },
+          barMaxWidth: 8,
+        },
+        {
+          name: 'GL20', type: 'line', data: bma.gl20, xAxisIndex: bmaPane, yAxisIndex: bmaPane,
+          showSymbol: false, lineStyle: { width: 1.4, color: C.gl20 }, itemStyle: { color: C.gl20 },
+          markLine: {
+            // 原式三条虚线：+5 / 0 / -5。0 用 COLOR2191DE（偏蓝），±5 灰。
+            symbol: 'none', silent: true,
+            data: [
+              { yAxis: 5, lineStyle: { color: C.muted, type: 'dotted', width: 1 } },
+              { yAxis: 0, lineStyle: { color: '#2191de', type: 'dotted', width: 1 } },
+              { yAxis: -5, lineStyle: { color: C.muted, type: 'dotted', width: 1 } },
+            ],
+            label: { show: false },
+          },
+        },
+        {
+          // SMOOTHGL20 = MA(GL20,3)，原式 COLORYELLOW
+          name: 'SMOOTH', type: 'line', data: bma.smooth, xAxisIndex: bmaPane, yAxisIndex: bmaPane,
+          showSymbol: false, lineStyle: { width: 1, color: C.glSmooth }, itemStyle: { color: C.glSmooth },
+        },
+        {
+          // 附图里的 MA20（成交额加权）本身，方便目视乖离的方向。
+          // 名字不能也叫 MA20 —— 图例按名字去重，会与主图的均线串成一项。
+          name: 'VMA20', type: 'line', data: bma.ma20, xAxisIndex: bmaPane, yAxisIndex: bmaPane,
+          showSymbol: false, lineStyle: { width: 1, color: C.glMa20, opacity: 0.7 },
+          itemStyle: { color: C.glMa20 },
         },
       ] : []),
     ],
