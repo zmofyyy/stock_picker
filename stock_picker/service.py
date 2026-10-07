@@ -28,6 +28,7 @@ from .limits import (
 )
 from .names import NameIndex
 from .shares import FloatShareIndex
+from .divfactor import DivFactorIndex, build_factor_series
 from .watchblocks import WatchBlockIndex
 from .tdx_reader import (
     BARS_COLUMNS,
@@ -148,6 +149,16 @@ class MarketService:
         )
         try:
             self.watch_blocks.load(force=False)
+        except Exception:
+            pass
+        #: 除权除息事件表（gbbq 的 category=1）：给「偏离度」附图折算前复权用。
+        #: 行情缓存里的 close/amount/volume 都是**不复权**原始值，要统一折算
+        #: 才能跨除权日比较（详见 divfactor.py 与 _bias 的 docstring）。
+        self.div_factors = DivFactorIndex(
+            config.get("tdx_dir"), cache_file=CACHE_DIR.parent / "div_factors.json"
+        )
+        try:
+            self.div_factors.load(force=False)
         except Exception:
             pass
         self._bars: Optional[pd.DataFrame] = None
@@ -468,6 +479,11 @@ class MarketService:
              })
         _try("流通股本", lambda: self.shares.load(force=False),
              lambda _: {"codes": int((self.shares.info() or {}).get("size") or 0)})
+        _try("复权因子", lambda: self.div_factors.load(force=False),
+             lambda _: {
+                 "codes": self.div_factors.size(),
+                 "events": int((self.div_factors.meta or {}).get("events") or 0),
+             })
 
         # 行情缓存：不存在或过期时重建（这一步最慢，8~10s）。
         # 整段拿住重建锁，并在锁内重新判一次新旧 —— 否则可能与手点「刷新数据」
@@ -2660,6 +2676,9 @@ class MarketService:
             for i, (d, r) in enumerate(zip(dates, ratios))
             if r is not None and r >= 2.0
         ]
+        # 偏离度附图要用前复权因子把 close/amount/volume 统一折算
+        # （行情缓存三列都是不复权；因子在跨除权日时才起作用）。
+        bias = self._bias(full, factor=self._div_factor_series(sub), tail=len(sub))
         return {
             "ok": True,
             "bars": len(sub),
@@ -2671,11 +2690,106 @@ class MarketService:
             "pct": pct,
             "ma": mas,
             "macd": self._macd(closes, tail=len(sub)),
+            "bias": bias,
             "signals": signals,
             "latest": {
                 "date": dates[-1] if dates else None,
                 "close": round(float(sub["close"].iloc[-1]), 3),
             },
+        }
+
+    def _div_factor_series(self, sub: pd.DataFrame) -> Optional[List[float]]:
+        """给一段**按日期升序**的日线，算出与它等长的**前复权因子**。
+
+        ``sub`` 必须是**不复权**的日线（本项目缓存即如此）。返回 ``None``
+        表示没有除权数据可用 —— 此时 :meth:`_bias` 会退化为「不复权直算」。
+        """
+        idx = getattr(self, "div_factors", None)
+        if idx is None or not getattr(idx, "events", None):
+            return None
+        code = sub["code"].iloc[0] if "code" in sub else None
+        if code is None:
+            return None
+        events = idx.events_of(str(code))
+        if not events:
+            # 该票没有任何除权事件 → 原始价即前复权价，因子恒为 1
+            return [1.0] * len(sub)
+        dates = [int(d) for d in sub["date"]]
+        closes = [float(c) for c in sub["close"]]
+        return build_factor_series(dates, closes, events)
+
+    @staticmethod
+    def _bias(full: pd.DataFrame, factor: Optional[List[float]] = None,
+              tail: int = 0, window: int = 250) -> Dict[str, List[Optional[float]]]:
+        """成交额加权成本均线的「偏离度」附图（对应通达信公式）。
+
+        通达信原式::
+
+            FQ    := DIVFACTOR(1) / CONST(DIVFACTOR(1));
+            MA250 := SUM(AMOUNT*FQ, N6) / SUM(VOL, N6) / 100;
+            T     := ((CLOSE - MA250) / CLOSE) * 100;
+            M5    := EMA(T, 3);
+            M20   := EMA(T, 20);
+
+        **为什么必须用复权因子**：本项目缓存的 ``close`` / ``amount`` /
+        ``volume`` **三者都是不复权原始值**（实测 ``000002.SZ`` 2003-05-23
+        10 送 10 时 ``close`` 从 13.81 腰斩到 6.79、``amount`` 却连续不跳；
+        另经全市场 20 万条抽样 ``close / (amount/volume)`` 中位数 1.0001）。
+        若直接用原始值算 250 日加权均价，跨除权日会把两种「价位尺度」平均在
+        一起 —— 除权前的价格是除权后的若干倍，算出来的 ``MA250`` 和 ``T``
+        在除权日会**假跳空**。故先用前复权因子把三列统一折算到最新口径，
+        再算指标（这正是原式乘 ``FQ`` 的用意）。
+
+        **量纲**：通达信的 ``VOL`` 以「手」计、``AMOUNT`` 以「元」计，所以
+        ``AMOUNT/VOL/100`` 才得到「元/股」。本项目缓存 ``volume`` 存的是
+        **股**，故 ``amount/volume`` 已是「元/股」，**不再除 100**。
+
+        ``MA250`` 用 ``rolling(window).sum()`` 是**末尾对齐的滑动窗口**：第 i 根
+        只用到 ``[i-window+1, i]``，不引入未来函数；窗口不足时给 ``None``。
+
+        ``factor`` 是与 ``full`` 等长的前复权因子（1.0 = 最新交易日）；
+        传 ``None`` 时退化为「不复权直算」（口径不严谨，仅作降级兜底）。
+        """
+        n = len(full)
+        empty = {"ma250": [None] * tail, "t": [None] * tail,
+                 "m5": [None] * tail, "m20": [None] * tail,
+                 "window": int(window), "adjusted": factor is not None}
+        if n == 0 or "amount" not in full or "volume" not in full:
+            return empty
+        amt = full["amount"].astype("float64")
+        vol = full["volume"].astype("float64")
+        closes = full["close"].astype("float64")
+
+        if factor is not None and len(factor) == n:
+            f = pd.Series(factor, index=full.index, dtype="float64")
+            # 前复权：价格乘因子；成交额不变（钱是钱）；股数除以因子
+            #   P_adj = P_raw * F          -> 用 F 折算价格
+            #   AMOUNT_adj = AMOUNT        -> 成交额与复权无关
+            #   VOL_adj = VOL / F          -> 使 AMOUNT_adj/VOL_adj = P_adj
+            # 这样 (AMOUNT_adj)/(VOL_adj) 与前复权价同尺度，
+            # 且 SUM(AMOUNT)/SUM(VOL/F) 仍是「成交额加权的复权均价」。
+            closes = closes * f
+            vol = vol / f.replace(0.0, pd.NA).astype("float64")
+
+        amt_sum = amt.rolling(int(window), min_periods=int(window)).sum()
+        vol_sum = vol.rolling(int(window), min_periods=int(window)).sum()
+        ma250 = amt_sum / vol_sum                    # 元/股（复权后）
+        ma250 = ma250.replace([np.inf, -np.inf], np.nan)
+        t = ((closes - ma250) / closes) * 100.0
+        m5 = t.ewm(span=3, adjust=False).mean()
+        m20 = t.ewm(span=20, adjust=False).mean()
+
+        def pick(s: pd.Series) -> List[Optional[float]]:
+            s = s.tail(int(tail)) if tail else s
+            return [None if pd.isna(v) else round(float(v), 4) for v in s]
+
+        return {
+            "ma250": pick(ma250),
+            "t": pick(t),
+            "m5": pick(m5),
+            "m20": pick(m20),
+            "window": int(window),
+            "adjusted": factor is not None,
         }
 
     @staticmethod

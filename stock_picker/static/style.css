@@ -474,6 +474,11 @@ label.inline input:focus { outline: none; border-color: var(--accent); }
 .drawer-body { flex: 1; overflow: auto; padding: 14px 18px 26px; }
 .chart { width: 100%; height: 420px; }
 .chart.tall { height: 620px; }
+/* 抽屉里的个股 K 线：带「偏离度」附图时多一栏，需要更高的画布。
+   高度改由 JS 切 .with-bias 控制（见 app.js::loadKline）——ECharts 按容器
+   实际像素算 grid，容器矮了最下面那栏会被裁掉。
+   640 与 app.js 里三栏 grid 的 top/height 是配套的，改一处要改两处。 */
+#klineChart.tall.with-bias { height: 640px; }
 .chart.small { height: 180px; margin-top: 8px; }
 
 .plan-bar {

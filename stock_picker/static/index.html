@@ -702,6 +702,10 @@
         <label class="inline">K线根数
           <input type="number" id="klineBars" value="160" min="30" max="1000" step="10" />
         </label>
+        <label class="inline" title="偏离度 = (收盘 − 250日成交额加权均价) / 收盘 × 100%，含 3日/20日 EMA（按前复权口径计算）">
+          <input type="checkbox" id="klineBiasOn" checked />
+          偏离度
+        </label>
         <button class="btn small" id="btnKlineReload">重载</button>
         <button class="btn small" id="btnDrawerClose">关闭</button>
       </div>

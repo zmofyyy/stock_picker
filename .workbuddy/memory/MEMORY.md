@@ -138,7 +138,21 @@
 - **下拉只显示 `显示名 · 成员数`**（不拼 `.blk` 后缀、不重复文件名），成员数 0 的置灰不可选；条件栏**只有显示名 ≠ 文件名时**才补 `（JXJC_CX）`。
 - 回归 `packaging/watchblock_test.py`（**9 节**，含**动态扫描**；用 `tempfile` 造假 TDX 根目录，**绝不碰真实目录**）：`STOCK_PICKER_HOME=<独立HOME> C:\Python313\python.exe packaging/watchblock_test.py`。
 
-## 13. 验证方法论
+## 13. 复权因子与偏离度附图（`divfactor.py`）
+
+- **⚠️ 最重要的一条事实**：本项目行情缓存 `close` / `amount` / `volume` **三列全部是不复权原始值、同尺度**。证据 = 全市场 20 万条抽样 `close ÷ (amount/volume)` **中位数 1.0001 / 99.97% 落在 [0.9,1.1]**；铁证 `000002.SZ` 2003-05-23 `close` 13.81→6.79 腰斩而 `amount` 1.536亿→1.619亿**不跳变**。
+  **别再用单只股票或某个时间段的比值去推口径**（我连错三次：先猜「前复权可省 FQ」，再因 600000 近期比值≈1 误判，最后把 close 腰斩当「前复权证据」反了方向）。要下结论就**全市场大样本 + 看分布**。
+- **`FQ` 不可省**（用户明确纠偏）：跨除权日算 250 日 `Σamount/Σvolume` 会把两种价位尺度混合 → `T` 假跳空。实测 `000002` 2003-05-23 **复权 +11.48% vs 不复权 −77.46%**（差 88 个百分点）。
+- **数据源** `T0002/hq_cache/gbbq` → `GbbqReader().get_df()` 8 列。**`category==1` = 除权除息**（65810 条/6284 只），四列**每 10 股口径**；`category==5` = 股本变化（`shares.py` 已用，别混）。
+- **前复权因子（直接式，无需递推）**：`ratio = 1+(songgu+peigu)/10`；`f = [1−(hongli/10 − peigujia*peigu/10)/P_raw(前一日)]/ratio`；`F(t)` = `t` **之后**所有除权日 `f` 连乘（最新一日恒 1.0）。**第一版误写成递推式（依赖 f_next），重构为直接式才对。**
+- **三列折算（用户选定前复权）**：`P_adj = P_raw × F`、**`AMOUNT_adj = AMOUNT`（钱不折）**、`VOL_adj = VOL / F`。
+- **量纲差异（最易错）**：通达信 `VOL` 是**手**、`AMOUNT` 是**元** → 原式 `/100` 把元/手换成元/股；**本项目 `volume` 是「股」，故 `amount/volume` 已是元/股、不再除 100**（`本项目 = 通达信 VOL × 100`，`/100` 恰好抵消）。
+- 索引缓存 `data/div_factors.json`；事件表**定点化存 ×1000 整数**（绕开 JSON 浮点尾巴）；`PARSE_VERSION` 改动要 +1；`load()` 降级为空索引不抛异常，`refresh()` = `load(force=False)`。
+- `_bias(full, factor=None, tail=0, window=250)`：`t` 用 `ewm(span=3/20, adjust=False)`（**等价 `EMA(T,3)` / `EMA(T,20)`**）；窗口不足处为 `None`；`adjusted` 标记是否有除权事件。
+- 回归 `packaging/divfactor_test.py` **8 节**：前提同口径 / 事件表核对 / 抹平跳空 / 单步公式 / 无事件股因子恒 1 / T 不假跳空 / 内部一致性 / 量纲。
+- **前端三处必须同步改**（否则最下栏**静默裁掉**）：`style.css` `#klineChart.tall.with-bias{height:640px}`（原 620）、`app.js` 三栏 `grid`（296/108/138）、`showBias` 计算（**必须先定义再用**）。关掉回落 620 两栏 + `dataZoom.xAxisIndex` 变 `[0,1]`。
+
+## 14. 验证方法论
 
 - **别用截图当唯一证据**：同一趟浏览器脚本里把 `getBoundingClientRect()` / `innerText` / `scrollWidth` / `getComputedStyle()` 一起取回 —— 数值可靠，像素会看错。**主题配色同理**（曾误判页面渲染成浅色，实测 `body` 为 `rgb(28,28,30)`、反色像素数全为 0）。**对比页面与接口前先对齐入参**（曾因页面默认 `with_members_only=1` 误判口径不一致）。细节案例见当日日志。
 - 测试里**别重写路径规则**（`incon.dat` 在 TDX **根目录**，不在 `hq_cache`）→ 用模块自己的 `BI._sources()`。

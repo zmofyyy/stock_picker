@@ -20,6 +20,10 @@ const C = {
   ma20: '#bf5af2',
   ma60: '#98989d',
   volma: '#64d2ff',
+  // 偏离度附图（通达信原作 COLOR2191ED）：主体 T 线沿用该蓝色
+  bias: '#2191ed',
+  biasM5: '#ff9f0a',
+  biasM20: '#30d158',
 };
 
 const state = {
@@ -28,6 +32,7 @@ const state = {
   watch: [],
   current: null,
   klineChart: null,
+  klineBias: true,      // 偏离度附图默认显示（抽屉顶部可关）
   pollTimer: null,
   industries: [],       // 全部二级行业名
   industryTree: {},     // 一级 -> [二级]
@@ -1941,6 +1946,8 @@ function openDrawer(row) {
   state.current = row;
   $('#drawer').hidden = false;
   $('#drawerMask').hidden = false;
+  // 勾选框是「持久偏好」：每次开抽屉把控件同步回 state，避免关闭过的人再打开时对不上
+  $('#klineBiasOn').checked = state.klineBias !== false;
   $('#drawerTitle').textContent = `${row.code} ${row.name || ''}`;
   const ind = [row.industry_l1, row.industry_l2, row.industry_l3].filter(Boolean).join(' / ');
   const cpts = row.concepts || [];
@@ -1994,6 +2001,11 @@ function openDrawer(row) {
     loadKline();
   };
   ['dBuy', 'dSell'].forEach((id) => { $('#' + id).onchange = loadKline; });
+  // 偏离度附图开关：只改状态并重画（不重新请求数据），默认开
+  $('#klineBiasOn').onchange = (e) => {
+    state.klineBias = !!e.target.checked;
+    loadKline();
+  };
   loadKline();
 }
 
@@ -2017,8 +2029,18 @@ async function loadKline() {
   const buy = Number($('#dBuy').value) || null;
   const sell = Number($('#dSell').value) || null;
 
+  /* 偏离度附图（对应通达信公式）：T = (close - MA250)/close*100，M5/M20 为 T 的 EMA。
+     数据由后端用**前复权**口径算好（行情缓存本身是不复权的，跨除权日直算会假跳空）。 */
+  const bias = d.bias || {};
+  const showBias = !!(bias.t && bias.t.some((v) => v != null)) && state.klineBias !== false;
+
   if (!state.klineChart) state.klineChart = echarts.init($('#klineChart'));
   const chart = state.klineChart;
+  // 附图开关会改变栅格布局：容器高度必须跟着变，否则 ECharts 算出来的
+  // grid 会超出画布（表现为最下面那栏被裁掉）。改完 class 先 resize，
+  // setOption 之后还会再 resize 一次。
+  $('#klineChart').classList.toggle('with-bias', showBias);
+  chart.resize();
 
   const volColors = d.ohlc.map((o) => (o[1] >= o[0] ? UP : DOWN));
   const signalIdx = (d.signals || []).map((s) => s.index);
@@ -2053,7 +2075,9 @@ async function loadKline() {
     legend: {
       top: 4, left: 8, itemGap: 14,
       textStyle: { color: C.muted }, inactiveColor: '#48484a',
-      data: ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '20日均量'],
+      data: showBias
+        ? ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '20日均量', 'T', 'M5', 'M20']
+        : ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '20日均量'],
     },
     tooltip: {
       trigger: 'axis', axisPointer: { type: 'cross' },
@@ -2066,19 +2090,51 @@ async function loadKline() {
         const prev = i > 0 ? d.ohlc[i - 1][1] : h[0];
         const chg = prev ? (h[1] / prev - 1) * 100 : 0;
         const c = chg >= 0 ? UP : DOWN;
+        let extra = '';
+        if (showBias) {
+          const tv = bias.t[i];
+          const m5v = (bias.m5 || [])[i];
+          const m20v = (bias.m20 || [])[i];
+          const tc = tv == null ? C.muted : (tv >= 0 ? UP : DOWN);
+          extra = `<br/>偏离度 <b style="color:${tc}">${tv == null ? '—' : tv.toFixed(2) + '%'}</b>　`
+            + `M5 ${m5v == null ? '—' : m5v.toFixed(2)}　M20 ${m20v == null ? '—' : m20v.toFixed(2)}`;
+        }
         return `<b>${d.dates[i]}</b><br/>开 ${fmt(h[0])}　高 ${fmt(h[3])}<br/>低 ${fmt(h[2])}　收 <b style="color:${c}">${fmt(h[1])}</b><br/>`
           + `涨跌 <span style="color:${c}">${chg.toFixed(2)}%</span><br/>`
           + `量 ${fmtInt(d.volume[i])} 手　均量 ${fmtInt(d.volume_ma[i])} 手<br/>`
-          + `量比 <b>${fmt(d.vol_ratio[i], 2)}×</b>`;
+          + `量比 <b>${fmt(d.vol_ratio[i], 2)}×</b>` + extra;
       },
     },
     axisPointer: { link: [{ xAxisIndex: 'all' }] },
     graphic: priceLabels.length ? priceLabels : undefined,
-    grid: [
+    grid: showBias ? [
+      // 三栏：主图 / 成交量 / 偏离度。总高 640（CSS #klineChart.with-bias），
+      // 底部留 ~26px 给 dataZoom 滑块。
+      { left: 58, right: 26, top: 34, height: 296 },
+      { left: 58, right: 26, top: 344, height: 108 },
+      { left: 58, right: 26, top: 466, height: 138 },
+    ] : [
       { left: 58, right: 26, top: 34, height: 330 },
       { left: 58, right: 26, top: 400, height: 140 },
     ],
-    xAxis: [
+    xAxis: showBias ? [
+      {
+        type: 'category', data: d.dates, gridIndex: 0, boundaryGap: true,
+        axisLine: { lineStyle: { color: C.line } }, axisLabel: { show: false },
+        splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
+      },
+      {
+        type: 'category', data: d.dates, gridIndex: 1, boundaryGap: true,
+        axisLine: { lineStyle: { color: C.line } }, axisLabel: { show: false },
+        splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
+      },
+      {
+        type: 'category', data: d.dates, gridIndex: 2, boundaryGap: true,
+        axisLine: { lineStyle: { color: C.line } },
+        axisLabel: { color: C.muted, formatter: (v) => v.slice(5) },
+        splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
+      },
+    ] : [
       {
         type: 'category', data: d.dates, gridIndex: 0, boundaryGap: true,
         axisLine: { lineStyle: { color: C.line } }, axisLabel: { show: false },
@@ -2091,7 +2147,24 @@ async function loadKline() {
         splitLine: { show: false }, min: 'dataMin', max: 'dataMax',
       },
     ],
-    yAxis: [
+    yAxis: showBias ? [
+      {
+        scale: true, gridIndex: 0, splitLine: { lineStyle: { color: C.grid } },
+        axisLabel: { color: C.muted }, axisLine: { show: false },
+        min: (v) => axisSpan(v).lo,
+        max: (v) => axisSpan(v).hi,
+      },
+      {
+        gridIndex: 1, splitLine: { show: false }, axisLabel: { color: C.muted, showMaxLabel: false },
+        axisLine: { show: false }, axisTick: { show: false },
+      },
+      {
+        // 偏离度：带正负号的百分比，轴标加 '%'
+        scale: true, gridIndex: 2, splitLine: { lineStyle: { color: C.grid } },
+        axisLabel: { color: C.muted, formatter: (v) => `${fmt(v, 0)}%` },
+        axisLine: { show: false }, axisTick: { show: false },
+      },
+    ] : [
       {
         scale: true, gridIndex: 0, splitLine: { lineStyle: { color: C.grid } },
         axisLabel: { color: C.muted }, axisLine: { show: false },
@@ -2103,7 +2176,13 @@ async function loadKline() {
         axisLine: { show: false }, axisTick: { show: false },
       },
     ],
-    dataZoom: [
+    dataZoom: showBias ? [
+      { type: 'inside', xAxisIndex: [0, 1, 2], start: 40, end: 100 },
+      { type: 'slider', xAxisIndex: [0, 1, 2], bottom: 4, height: 16, start: 40, end: 100,
+        borderColor: C.line, fillerColor: 'rgba(10,132,255,.16)',
+        handleStyle: { color: C.accent }, moveHandleStyle: { color: C.accent },
+        dataBackground: { lineStyle: { color: C.line }, areaStyle: { color: C.grid } } },
+    ] : [
       { type: 'inside', xAxisIndex: [0, 1], start: 40, end: 100 },
       { type: 'slider', xAxisIndex: [0, 1], bottom: 4, height: 16, start: 40, end: 100,
         borderColor: C.line, fillerColor: 'rgba(10,132,255,.16)',
@@ -2140,6 +2219,29 @@ async function loadKline() {
         name: '20日均量', type: 'line', data: d.volume_ma, xAxisIndex: 1, yAxisIndex: 1,
         showSymbol: false, lineStyle: { width: 1.2, color: C.volma }, itemStyle: { color: C.volma },
       },
+      ...(showBias ? [
+        {
+          // 偏离度主体线：T = (close - MA250)/close*100
+          // 用 0 轴虚线做基准（对应原公式 `0,,DOTLINE,COLOR2191ED`），
+          // 线在 0 上方=价格高于长期成交额加权成本，下方=低于。
+          name: 'T', type: 'line', data: bias.t, xAxisIndex: 2, yAxisIndex: 2,
+          showSymbol: false, lineStyle: { width: 1.6, color: C.bias },
+          itemStyle: { color: C.bias },
+          markLine: {
+            symbol: 'none', silent: true,
+            data: [{ yAxis: 0, lineStyle: { color: C.bias, type: 'dotted', width: 1 } }],
+            label: { show: false },
+          },
+        },
+        {
+          name: 'M5', type: 'line', data: bias.m5, xAxisIndex: 2, yAxisIndex: 2,
+          showSymbol: false, lineStyle: { width: 1, color: C.biasM5 }, itemStyle: { color: C.biasM5 },
+        },
+        {
+          name: 'M20', type: 'line', data: bias.m20, xAxisIndex: 2, yAxisIndex: 2,
+          showSymbol: false, lineStyle: { width: 1.2, color: C.biasM20 }, itemStyle: { color: C.biasM20 },
+        },
+      ] : []),
     ],
   };
   chart.setOption(option, true);
