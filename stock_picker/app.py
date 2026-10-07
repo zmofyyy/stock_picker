@@ -482,6 +482,60 @@ def board_kline(
         raise HTTPException(500, f"读取板块指数 K 线失败：{exc}") from exc
 
 
+@app.get("/api/watch_blocks")
+def watch_blocks(rebuild: bool = Query(False)) -> Dict[str, Any]:
+    """自选板块清单（通达信 ``T0002/blocknew``）。
+
+    与 ``/api/board_catalog`` 的区别：那是通达信**自带**的行业 / 地区 /
+    概念 / 风格分类，这是**用户手工维护**的自选板块，随增删而变。
+    每项带 ``key``（``.blk`` 文件名，前端引用用）与 ``name``（中文显示名）。
+
+    每次调用都会重算源文件指纹（``os.stat`` 那 20 来个文件，0.34ms）——
+    在通达信里新加 / 改名 / 删掉自选板块之后，**刷新页面就能看到最新清单**。
+    ``rebuild=true`` 则无条件重新解析（指纹正常时不需要）。
+    """
+    if rebuild:
+        service.watch_blocks.load(force=True)
+    return service.watch_block_catalog()
+
+
+@app.get("/api/watch_block_panel")
+def watch_block_panel(
+    block: str = Query(..., description="自选板块，传 key（如 ZFPZ）或中文名（如 窄幅盘整）"),
+    date: Optional[str] = Query(None, description="交易日 YYYY-MM-DD；留空 = 最新交易日"),
+    industries: str = Query("", max_length=400, description="二级行业，逗号分隔；留空 = 不限"),
+    concepts: str = Query("", max_length=800, description="概念，逗号分隔；留空 = 不限"),
+    concept_mode: str = Query("any", description="any = 命中任一 / all = 同时命中全部"),
+    exclude_st: Optional[bool] = Query(None, description="剔除 ST / 退市；留空 = 剔除"),
+    min_amount: float = Query(0.0, ge=0.0, description="最小成交额（元）"),
+    sort: str = Query("amount", description="amount/mcap/pct/close/concept_n/industry/code/name"),
+    max_rows: int = Query(800, ge=1, le=3000, description="明细最多返回多少行"),
+) -> Dict[str, Any]:
+    """自选板块看盘：成员股 + 二级行业分布 + 概念分布。
+
+    返回的 ``industry_summary`` / ``concept_summary`` 就是两个分布卡的数据
+    （``groups`` 是 chip 列表）。它们的统计基数 ``summary_base`` 是**过滤前**
+    的成员集 —— 这样点掉一个行业之后其余 chip 不会连带消失。
+    """
+    params: Dict[str, Any] = {
+        "block": block,
+        "date": date,
+        "concept_mode": concept_mode,
+        "exclude_st": exclude_st,
+        "min_amount": float(min_amount),
+        "sort": sort,
+        "max_rows": int(max_rows),
+    }
+    # 空串与未传同义（本页没有「一个都不选」需要被区别对待的语义 ——
+    # 不选行业/概念就是「不限」，不像交集页那边空列表要报错）
+    params["industries"] = as_multi(industries) if industries else []
+    params["concepts"] = as_multi(concepts) if concepts else []
+    try:
+        return service.watch_block_panel(params)
+    except Exception as exc:
+        raise HTTPException(500, f"自选板块计算失败：{exc}") from exc
+
+
 @app.get("/api/trade_dates")
 def trade_dates(n: int = Query(0, ge=0, le=20000)) -> Dict[str, Any]:
     """本地数据覆盖的交易日（升序 ISO）。

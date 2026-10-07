@@ -52,6 +52,21 @@
 /* 作者样式里的 display 会覆盖 UA 的 [hidden]{display:none}，这里显式兜住 */
 [hidden] { display: none !important; }
 
+/* --------------------------------------------------------------------------
+   原生下拉的 <option> 必须显式配色
+   --------------------------------------------------------------------------
+   弹开的选项列表由操作系统绘制，:root 的 color-scheme:dark 在 macOS 上够用，
+   但在 Windows 上 Chrome/Edge 常把弹层底仍涂成系统默认的白色，而 <option>
+   的文字却继承了作者的 color（--text，接近纯白）→ 白底白字，不悬停就看不见。
+   （用户 2026-10-07 反馈：「只能看到 hover 的 item，其他显示白底」）
+   显式给 option 指定深底浅字即可，Windows / macOS 都正确。
+   注意：option 的 background 只在弹层里生效，不影响 select 本体。 */
+select option {
+  background-color: var(--surface);
+  color: var(--text);
+}
+select option:disabled { color: var(--muted); }
+
 html { height: 100%; }
 
 body {
@@ -763,3 +778,22 @@ tbody tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 /* 结果表里「命中概念」列 */
 .hit-cell { max-width: 260px; overflow: hidden; }
 .hit-empty { color: var(--muted); font-size: 11.5px; }
+
+/* ==================================================================
+   自选板块（通达信 T0002/blocknew）
+   复用选股页的 .ind-summary / .ind-chip 分布卡与交集页的 .hit-cell；
+   这里只补成员表宽度与下拉框的一点细节。
+   ================================================================== */
+#wbTable { min-width: 1120px; }        /* 11 列 */
+#wbTable th, #wbTable td { padding: 5px 7px; }
+#wbTable thead th.sortable { cursor: pointer; user-select: none; }
+#wbTable thead th.sortable:hover { color: var(--text); background: var(--mid); }
+#wbTable thead th.sorted {
+  color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+/* 自选板块下拉框：只显示「板块名 · 成员数」，最长约「GL20-12-04 · 24」，
+   留一点余量即可；不再放文件名，免得被撑破。 */
+#wbSelect { min-width: 150px; max-width: 220px; }
+/* KPI 卡默认没有上边距（板块看盘那边靠 .bp-split 的 gap 分开） */
+#wbKpiCard { margin-top: 0; }

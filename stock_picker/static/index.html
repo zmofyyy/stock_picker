@@ -57,6 +57,12 @@
         </svg>
         <span>板块交集</span>
       </button>
+      <button class="tab" data-tab="watchblock">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8-5.2 2.8 1-5.9L3.5 9.7l5.9-.8z" />
+        </svg>
+        <span>自选板块</span><b id="wbCount">0</b>
+      </button>
       <button class="tab" data-tab="plan">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M9 11.5l2.5 2.5L20 5" />
@@ -542,6 +548,90 @@
                   <th class="num sortable" data-sort="amount_yi" data-label="成交额(亿)" title="点击按成交额排序">成交额(亿)</th>
                   <th class="num sortable" data-sort="float_mcap_yi" data-label="流通市值(亿)" title="点击按流通市值排序">流通市值(亿)</th>
                   <th class="sortable" data-sort="board" data-label="板块" title="点击按板块排序">板块</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 自选板块 ============ -->
+      <section class="panel" id="panel-watchblock">
+        <div class="card">
+          <div class="filters">
+            <label>自选板块
+              <select id="wbSelect" title="通达信 T0002/blocknew 里的自选板块；「· N」是文件里的成员数，空板块不可选"></select>
+            </label>
+            <label>交易日
+              <span class="date-field">
+                <input type="date" id="wbDate" title="留空＝最新交易日；仅支持交易日" />
+                <button type="button" class="mini" id="wbDateLatest" title="清除，回到最新交易日">最新</button>
+              </span>
+            </label>
+            <label>最小成交额(亿)
+              <input type="number" id="wbMinAmount" value="0" step="0.5" min="0" />
+            </label>
+            <label class="chk"><input type="checkbox" id="wbExcludeSt" checked /> 剔除 ST/退市</label>
+            <button class="btn primary" id="btnWbLoad">加载板块</button>
+            <button class="btn" id="btnWbRescan" title="重新扫描 T0002/blocknew：在通达信里新加 / 改名 / 删掉自选板块后点这里">重新扫描板块</button>
+            <button class="btn" id="btnWbClear">清空筛选</button>
+          </div>
+          <ul class="conditions" id="wbConditions"></ul>
+        </div>
+
+        <div class="card" id="wbKpiCard" hidden>
+          <div class="kpi-row" id="wbKpi"></div>
+        </div>
+
+        <div class="card" id="wbIndCard" hidden>
+          <div class="card-head">
+            <h2>二级行业分布 <span class="muted" id="wbIndMeta" title="分布基数是该板块当日有行情的成员数，不受行业/概念筛选影响；点标签即筛选，再点取消"></span></h2>
+            <button class="btn small" id="btnWbIndClear">清除行业筛选</button>
+          </div>
+          <div class="ind-summary" id="wbIndSummary"></div>
+        </div>
+
+        <div class="card" id="wbCptCard" hidden>
+          <div class="card-head">
+            <h2>概念分布 <span class="muted" id="wbCptMeta" title="分布基数是该板块当日有行情的成员数，不受行业/概念筛选影响；点标签即筛选，再点取消"></span></h2>
+            <div class="row-actions">
+              <label class="inline" title="多个概念时的匹配方式：任一命中（并集）/ 全部命中（交集）">匹配
+                <select id="wbCptMode">
+                  <option value="any">任一</option>
+                  <option value="all">全部</option>
+                </select>
+              </label>
+              <button class="btn small" id="btnWbCptClear">清除概念筛选</button>
+            </div>
+          </div>
+          <div class="ind-summary" id="wbCptSummary"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>成员股 <span class="muted" id="wbMeta"></span></h2>
+            <div class="row-actions">
+              <span class="muted hint" id="wbSortHint"></span>
+              <button class="btn small" id="wbSortReset" hidden>恢复默认</button>
+              <button class="btn small" id="btnWbExport">导出 CSV</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table id="wbTable">
+              <thead>
+                <tr>
+                  <th class="sortable" data-sort="code" data-label="代码" title="点击按代码排序">代码</th>
+                  <th class="sortable" data-sort="name" data-label="名称" title="点击按名称排序">名称</th>
+                  <th class="sortable" data-sort="industry_l2" data-label="二级行业" title="点击按二级行业排序">二级行业</th>
+                  <th class="sortable" data-sort="hit_n" data-label="命中概念" title="点击按命中概念数排序">命中概念</th>
+                  <th class="num sortable" data-sort="concept_n" data-label="概念数" title="点击按概念总数排序">概念数</th>
+                  <th class="num sortable" data-sort="close" data-label="收盘价" title="点击按收盘价排序">收盘价</th>
+                  <th class="num sortable" data-sort="pct_change" data-label="涨跌幅" title="点击按涨跌幅排序">涨跌幅</th>
+                  <th class="num sortable" data-sort="amount_yi" data-label="成交额(亿)" title="点击按成交额排序">成交额(亿)</th>
+                  <th class="num sortable" data-sort="float_mcap_yi" data-label="流通市值(亿)" title="点击按流通市值排序">流通市值(亿)</th>
+                  <th class="sortable" data-sort="board" data-label="板块" title="点击按板块排序">板块</th>
+                  <th class="sortable" data-sort="limit" data-label="涨跌停" title="点击按涨跌停排序">涨跌停</th>
                 </tr>
               </thead>
               <tbody></tbody>

@@ -6,7 +6,7 @@
 
 - 工作区 `E:\sourcecode\stock_picker`（旧笔记的 `F:\source\stock_rsi`、`F:\source\stock_blocks\stock_watch` **已不存在**）。
 - 主体 `stock_picker/`：FastAPI + pandas/numpy，原生 JS 单页 + 本地 ECharts，**无构建步骤**。端口 **8778**。
-- 页签 6 个：选股 / 连板梯队 / 板块看盘 / 板块交集 / 计划 / 追踪。启动即后台预加载。
+- 页签 7 个：选股 / 连板梯队 / 板块看盘 / 板块交集 / **自选板块**（§13）/ 计划 / 追踪。启动即后台预加载。
 - **解释器必须 `C:\Python313\python.exe`**；managed 的 `binaries\python\3.13.12` 缺 `annotated_doc`，导入即 `ModuleNotFoundError`。打包用 `envs\stockpicker-build\Scripts\python.exe`。
 - Bash 先补 PATH（PortableGit `usr/bin`）；PowerShell 工具**不回显 stdout**；**不能从 Bash 调 powershell**。
 
@@ -63,6 +63,8 @@
 - 抽屉 `min(1440px, 95vw)`，图高 620px；**`#klineChart` 必须是 `.drawer-body` 直接子元素** —— 曾多一个 `</div>` 被解析成 `.drawer` 子元素，图高 620→440 而页面照样打开（**沉默失败**）。
 - 布局：`body` 滚动 + `.sidebar` fixed + `.toolbar` sticky（不用「fixed 内部滚动」，否则截图截不全）。
 - 连板页行业/概念筛选走**本地** `streakFiltered()`；排序件 `orderBy/paintSortHeaders/bindSortHead` 多页共用；非默认页首次切过去才加载。
+- **凡交给 OS 绘制的原生控件都必须显式配色**（`color-scheme: dark` 跨平台不可靠）。已踩：`<option>` 在 **Windows** 上弹层底是系统白，文字继承 `--text` 近纯白 → **白底白字，不悬停看不见**。全局兜住在 `style.css` 开头 `[hidden]` 之后：`select option{background-color:var(--surface);color:var(--text)}` + `option:disabled{color:var(--muted)}`（`option` 的 background 只影响弹层，不动 select 本体）。日期控件 / 滚动条若要常显也得同样处理。
+- **下拉 `.blk` 类噪音要清**：给用户看**显示名**就够（`均线纠缠_初选 · 193`），文件名只在「用户改过名」时才补（`（JXJC_CX）`）。没改名的板块 `name == key`，拼 `.blk` 会让同一列出现两种排版、还撑破原生 select（238px → 精简后 150px）。
 
 ## 7. 行情缓存口径与内存账
 
@@ -93,6 +95,18 @@
 - 起独立进程：**PowerShell `Start-Process` 在本机不可用**（报 `已添加项。字典中的关键字:"Path"`）→ Python `subprocess.Popen(..., creationflags=DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP)`，`env` 传 `STOCK_PICKER_HOME`，轮询 `ready`；收尾 `taskkill //F //PID <pid>`。
 - **`agent-browser` 在本机基本不可用**（两次 `open` 各卡死 7 分钟+，也没 `resize`）→ 用 **headless Chrome + CDP**（冷启动到出图约 40s）。**Node 22 自带全局 `WebSocket`**，写零依赖驱动：`GET /json/list` 取 `webSocketDebuggerUrl` → `Page.enable`/`Runtime.enable`/`Emulation.setDeviceMetricsOverride`/`Page.navigate`/`Runtime.evaluate`（轮询 DOM）/`Page.captureScreenshot`（`captureBeyondViewport:true`）。**脚本 `%TEMP%\bp_shot.js` 可复用**（含 tab 切换 + 联动验证）。纯 API 验证用 `curl`。
 - **直接指向正在跑的 8778 截图**即可；**别用 `--port` 改端口**（会写回 `config.json`）。
+- **CDP 三个必踩的坑**（症状会伪装成「页面坏了」，其实全是探针的错）：
+  1. **`list[0]` 不一定是页面 target** —— 本机 headless Chrome 同时挂 `background_page`（扩展）/ `browser_ui` / `service_worker`。必须 `list.find(t => t.type === 'page' && (t.url||'').includes('8778'))`。挑错了会得到 `document.querySelectorAll('.nav .tab').length === 0`，看着像「前端没渲染」。
+  2. **app.js 里的函数不是全局**（`switchTab` / `state` 都在模块作用域）→ `Runtime.evaluate('switchTab(...)')` 报 `switchTab is not defined`。**切页签要派发真实事件**：`b.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}))`。
+  3. **Bash 调用结束会杀掉 `&` 起的 node**（同 §13 的服务进程）→ 用 `run_in_background: true`，或干脆全程前台（探针约 17s，前台可行）。
+  再加**硬超时自杀**（`setTimeout(()=>{chrome.kill();process.exit(2)},150000)`），否则残留 chrome 会一直占着调试端口，下一轮连不上。
+- 页签切换后要**轮询等面板填充**（`#wbSelect options.length > 0`），别用固定 `sleep` 拍脑袋。
+- **探针读不到 ≠ 应用坏了**（2026-10-07 踩过一整轮）：曾报「首次进自选板块 tab 时下拉 0 项」，
+  实为**两个探针侧的错** —— ① 用 `window.state.wbLoaded` 读**模块作用域变量**（恒 `null`）；
+  ② `Page.navigate` 还没生效 / 挑错 target 就 evaluate。**冷启动 60ms 就点 vs 等 `init()` 完再点，
+  两种都正常（都是 `n=11 rows=189`）**。规矩：下结论前先自证探针 —— 打印
+  `typeof switchTab` / `typeof loadWatchBlocks` / `document.querySelectorAll('.tab').length`；
+  **模块作用域的东西一律用 `typeof` 或不读，改看 DOM 真实状态**。
 
 ## 11. 板块看盘（`boards.py` + `service.board_*`）
 
@@ -108,9 +122,27 @@
 - 前端：`.bp-split` 必须 `minmax(0,·fr)`（否则被表撑破）；`.bp-pane` 本身是 grid 子项、**两张卡天然等高**（实测 553.06/553.06）；排序缺值永远沉底（`_sorted_rows`）。
 - 回归 `packaging/board_test.py`（**117 项 / 9 节**）：`STOCK_PICKER_HOME=<独立HOME> C:\Python313\python.exe packaging/board_test.py`。
 
-## 12. 验证方法论
+## 12. 自选板块（`watchblocks.py` + `service.watch_block_*`）
+
+- 读**用户手工维护**的 `T0002\blocknew\`（与 §11 的软件自带概念/行业板块**不同源**）：`blocknew.cfg` 给显示名 + 文件名，`*.blk` 给成员。结构 = 顶部**下拉单选** → KPI → **二级行业分布卡 / 概念分布卡**（复用选股页 chip 范式）→ 成员股明细表（11 列、点行开 K 线抽屉）。
+- API：`/api/watch_blocks`（清单，`?rebuild=true` 无条件强刷）、`/api/watch_block_panel`（参数名 **`block`**，**可传 key（`.blk` 文件名）或中文名**，两者等效）。
+- **⚡ 动态扫描（用户 2026-10-07 要求，不重启即见增删）**：三层都不能有「启动读一次」的快照 —— ① `WatchBlockIndex.refresh()` = `load(force=False)` 的薄封装，每次重算 `_signature()`，**变了才重建**；② `service.watch_block_catalog(refresh=True)` 默认先刷（**异常吞掉退回现有索引**，清单接口不能整个挂）；③ 前端 `switchTab('watchblock')` **每次切过来都重扫**，另有 `#btnWbRescan` 手动按钮（`{keep:true,notify:true}` 保留选中项 + toast 报告**有无变化**）。`init()` 末尾还**后台预取**一次（`silent:true`）。
+- **`_signature()` 必须覆盖 `cfg` + 目录下每个 `.blk`**（实测 24 文件、`DirEntry.stat()` **0.34ms**，可放每请求）。**只盯 cfg 会漏「往已有板块加减股票」** —— 那时 cfg 一个字节不变。反过来 **cfg 是清单权威来源**：只放 `.blk` 不写 cfg → **不入清单**（通达信自己会同步写两处）。
+- **`blocknew.cfg` 不是定长记录**：每字段以 `\x00` 结尾且**跨记录边界连续** → 必须按「连续非 0 段」切字段流再**两两配对**（前一个 GBK 显示名 / 后一个 ASCII 文件名）。**段数恒为板块数 ×2**，配对数 = 板块数，**全部命中磁盘**，零错配。**别按 25/50 字节定长切**（`集合竞价大量` 会被切成 `集合` + 半截跑到下一条尾部）。**当期实测**：1320 字节 → 22 段 → 11 组。
+- **`.blk` 定长：字节数 = 行数 × 9**，**不是 ×7**。布局「`\r\n` + 7 位代码」逐行重复、**无尾换行**（首个 CRLF 与「无尾换行」正好抵消）。空板块是 **0 字节**。
+- **`.blk` 首位是市场码**：`0`→sz、`1`→sh、`2`→bj，后 6 位是代码。文件里除数字与 CRLF **零杂字节** → 「提取全部数字按 7 位切」与「按行解析」等价，且对换行风格不敏感（`parse_blk` 用前者）。
+- **磁盘 `.blk` 比 cfg 多**：多出的 `tjg` / `zxg` 是通达信内部文件，一律进 `meta.verify.orphan_files`。`is_a_share()` **零剔除**；首位/后缀两种口径经 `MARKET_PREFIX` 折算后**逐项相等**。**别写死「21 个板块 / 1603 码」这类数字**（用户随时增删）。
+- **分布卡基数必须不受筛选影响**：`summary_base = list(dict.fromkeys(quoted_codes))` 后**立刻取两份分布快照**，**再**按行业/概念过滤。
+- 缓存 `data/watch_blocks.json` + `PARSE_VERSION`；`tdx_dir` 不存在时降级为空索引但字段齐全、不抛异常。
+- 明细「命中概念」列：**无概念筛选时展示该股最主要 3 个概念**（否则整列 `—` 白占地方）。
+- **下拉只显示 `显示名 · 成员数`**（不拼 `.blk` 后缀、不重复文件名），成员数 0 的置灰不可选；条件栏**只有显示名 ≠ 文件名时**才补 `（JXJC_CX）`。
+- 回归 `packaging/watchblock_test.py`（**9 节**，含**动态扫描**；用 `tempfile` 造假 TDX 根目录，**绝不碰真实目录**）：`STOCK_PICKER_HOME=<独立HOME> C:\Python313\python.exe packaging/watchblock_test.py`。
+
+## 13. 验证方法论
 
 - **别用截图当唯一证据**：同一趟浏览器脚本里把 `getBoundingClientRect()` / `innerText` / `scrollWidth` / `getComputedStyle()` 一起取回 —— 数值可靠，像素会看错。**主题配色同理**（曾误判页面渲染成浅色，实测 `body` 为 `rgb(28,28,30)`、反色像素数全为 0）。**对比页面与接口前先对齐入参**（曾因页面默认 `with_members_only=1` 误判口径不一致）。细节案例见当日日志。
 - 测试里**别重写路径规则**（`incon.dat` 在 TDX **根目录**，不在 `hq_cache`）→ 用模块自己的 `BI._sources()`。
 - 别写恒真的「占位断言」：判断「前缀聚合生效」要查**子集关系**且**核对对数 > 0**（否则空转通过）。
 - **已知小瑕疵（非 bug，别去查）**：`service` 上没有 `ready` 属性，测试开头的 `getattr(service, "ready", False)` **恒为 False**、总会多跑一次很便宜的 `refresh()`。
+- **测试用服务别指望跨 Bash 调用存活**：`subprocess.Popen` 起的分离进程会在该次 Bash 调用结束时被杀 → **起服务 + 跑测试必须塞进同一次 Bash 调用**（打包版冒烟同理，收尾 `taskkill //F //PID <pid>`）。环境有代理变量 → `Python urllib` 要 `ProxyHandler({})`、`subprocess` 要 `env.pop`；`curl` 在本机返回空 body。**类名是 `MarketService` 不是 `Service`**；`NameIndex(cache_file=…)` 必填（照抄 `app.py`）。
+- **测试里别写死常量**：`A 股=5602` / `命中=212` 都已过期成假失败；只写不变量与两路交叉核对。

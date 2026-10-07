@@ -28,6 +28,7 @@ from .limits import (
 )
 from .names import NameIndex
 from .shares import FloatShareIndex
+from .watchblocks import WatchBlockIndex
 from .tdx_reader import (
     BARS_COLUMNS,
     CACHE_DTYPES,
@@ -138,6 +139,15 @@ class MarketService:
         )
         try:
             self.boards.load(force=False)
+        except Exception:
+            pass
+        #: 用户自建的自选板块（T0002/blocknew），与 boards 完全独立：
+        #: 前者是通达信自带分类，后者是用户手工维护、会随增删而变。
+        self.watch_blocks = WatchBlockIndex(
+            config.get("tdx_dir"), cache_file=CACHE_DIR.parent / "watch_blocks.json"
+        )
+        try:
+            self.watch_blocks.load(force=False)
         except Exception:
             pass
         self._bars: Optional[pd.DataFrame] = None
@@ -451,6 +461,11 @@ class MarketService:
                  "boards": self.boards.size,
                  "with_members": int((self.boards.meta or {}).get("boards_with_members") or 0),
              })
+        _try("自选板块", lambda: self.watch_blocks.load(force=False),
+             lambda _: {
+                 "blocks": self.watch_blocks.size,
+                 "with_members": int((self.watch_blocks.meta or {}).get("blocks_with_members") or 0),
+             })
         _try("流通股本", lambda: self.shares.load(force=False),
              lambda _: {"codes": int((self.shares.info() or {}).get("size") or 0)})
 
@@ -522,6 +537,7 @@ class MarketService:
                 "industries": self.industries.size,
                 "concepts": self.concepts.concept_count,
                 "boards": self.boards.size,
+                "watch_blocks": self.watch_blocks.size,
                 "float_shares": int((self.shares.info() or {}).get("size") or 0),
             },
             "steps": steps,
@@ -1752,6 +1768,294 @@ class MarketService:
             "rows_count": len(rows),
             "elapsed": round(time.perf_counter() - t_start, 3),
         }
+
+    # ------------------------------------------------------------------
+    # 自选板块（T0002/blocknew，用户手工维护）
+    # ------------------------------------------------------------------
+    def watch_block_catalog(self, refresh: bool = True) -> Dict[str, Any]:
+        """自选板块清单：给下拉框用的 ``{key, name, n, ...}``。
+
+        ``key`` 是 ``.blk`` 文件名去掉后缀（ASCII，前端当引用传回），
+        ``name`` 是通达信里显示的 GBK 中文名。两者都带上 —— 有的板块用户
+        没改名，显示名就是文件名本身（``60-11-14`` / ``MACD_1-23``）。
+
+        ``refresh=True``（默认）时先重算源文件指纹：用户在通达信里新建 /
+        改名 / 删掉自选板块、或往板块里加减股票之后，**页面再调一次本接口
+        就能看到最新清单，不必重启服务**。指纹只是 ``os.stat`` 那 20 来个
+        文件（实测 0.34ms），随请求做没有负担；没变化时不会重新解析。
+        """
+        if refresh:
+            try:
+                self.watch_blocks.refresh()
+            except Exception:
+                pass          # 刷新失败就用现有索引，不能让清单接口整个挂掉
+        blocks = self.watch_blocks.catalog()
+        meta = self.watch_blocks.meta or {}
+        return {
+            "ok": True,
+            "blocks": blocks,
+            "total": len(blocks),
+            "with_members": sum(1 for b in blocks if b["has_members"]),
+            "member_codes": int(meta.get("member_codes") or 0),
+            "source": meta.get("source"),
+            "dir": meta.get("dir"),
+            "verify": meta.get("verify") or {},
+            "built_at": meta.get("built_at"),
+        }
+
+    def watch_block_panel(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """自选板块看盘：选中板块的成员股 + 二级行业 / 概念映射。
+
+        输出三块，对应界面上「下拉框 + 两个分布卡 + 明细表」::
+
+            industry_summary  二级行业分布（``industries.summary()``，chip 可点过滤）
+            concept_summary   概念分布（``concepts.summary()``）
+            rows              成员股明细（代码 / 名称 / 二级行业 / 概念数 / 涨幅）
+
+        分布基数口径（与选股页一致，是个容易被改坏的不变量）：
+        ``summary_base`` 是**在应用行业 / 概念过滤之前**的成员集，两个分布卡
+        永远按它统计 —— 否则点掉一个行业之后，其余 chip 会连带消失，
+        用户就没法「换一个看」。所以先取快照再过滤。
+
+        :param params: ``block``（板块文件名或显示名，必填）/ ``date``（锚点
+            交易日，空 = 最新）/ ``industries`` / ``concepts`` +
+            ``concept_mode``（``any`` 并集 / ``all`` 交集）/ ``exclude_st`` /
+            ``min_amount``（元）/ ``max_rows`` / ``sort``（默认按成交额降序）
+        """
+        t_start = time.perf_counter()
+        if self.watch_blocks.size == 0:
+            return {
+                "ok": False,
+                "reason": "未找到通达信自选板块目录 T0002/blocknew",
+                "rows": [],
+            }
+        ref = str(params.get("block") or params.get("key") or "").strip()
+        if not ref:
+            return {"ok": False, "reason": "缺少参数 block（自选板块）", "rows": []}
+        info = self.watch_blocks.resolve(ref)
+        if info is None:
+            return {
+                "ok": False,
+                "reason": f"未知自选板块 {ref}",
+                "blocks": self.watch_blocks.catalog(),
+                "rows": [],
+            }
+
+        codes = self.watch_blocks.members_of(info["key"])
+        block_info = dict(info)
+
+        cfg = self.config.section("screen")
+        industries = self.resolve_industries(params)
+        concepts = self.resolve_concepts(params)
+        concept_mode = str(params.get("concept_mode") or "any").lower()
+        if concept_mode not in ("any", "all"):
+            concept_mode = "any"
+        exclude_st = params.get("exclude_st")
+        if exclude_st is None:
+            exclude_st = True
+        min_amount = float(params.get("min_amount") or 0.0)
+        max_rows = max(1, int(params.get("max_rows") or 800))
+        sort_key = str(params.get("sort") or "amount").lower()
+
+        # 名称打错 → 恒空且不报错，是最难自查的失败，入口就挡掉。
+        if industries:
+            known = set(self.industries.l2_names())
+            unknown = [x for x in industries if x not in known]
+            if unknown:
+                return {
+                    "ok": False,
+                    "reason": f"未知二级行业：{'、'.join(unknown[:5])}",
+                    "unknown": unknown,
+                    "rows": [],
+                }
+        if concepts:
+            known_c = set(self.concepts.names())
+            unknown_c = [x for x in concepts if x not in known_c]
+            if unknown_c:
+                return {
+                    "ok": False,
+                    "reason": f"未知概念：{'、'.join(unknown_c[:5])}",
+                    "unknown": unknown_c,
+                    "rows": [],
+                }
+
+        df = self.bars()
+        if len(df) == 0:
+            return {
+                "ok": False,
+                "reason": "本地行情缓存为空，请先点『刷新数据』",
+                "rows": [],
+            }
+        anchor, err = self._anchor(params)
+        if err is not None:
+            return {**err, "rows": []}
+        assert anchor is not None
+        anchor_iso = ymd_to_iso(anchor)
+
+        base = {
+            "ok": True,
+            "block": block_info,
+            "date": anchor_iso,
+            "n_total": len(codes),
+            "industries": industries,
+            "concepts": concepts,
+            "concept_mode": concept_mode,
+            "exclude_st": exclude_st,
+            "min_amount": min_amount,
+            "rows": [],
+        }
+        if not codes:
+            base["reason"] = "该自选板块没有成分股（文件为空）"
+            return base
+
+        # --- 候选集：该板块成员 ∩ 锚点日有行情 ---------------------------
+        want = set(codes)
+        cats = df["code"].cat.categories
+        cat_ok = np.fromiter((c in want for c in cats), dtype=bool, count=len(cats))
+        idx = self._rows_in_window(np.array([anchor], dtype="int32"), cat_ok)
+        # 先 copy 再改列：后面还有几轮布尔过滤，链式赋值会退化成 copy-of-slice
+        work = df.iloc[idx].copy()
+        work["code"] = work["code"].astype(object)
+        if min_amount > 0 and len(work):
+            work = work[work["amount"] >= min_amount]
+        if exclude_st and len(work):
+            nm = {c: self.names.get(c) for c in work["code"].unique()}
+            work = work[~work["code"].map(lambda c: is_st_or_delisting(nm.get(c) or ""))]
+
+        quoted_codes = work["code"].tolist()
+        n_quoted = len(quoted_codes)
+        n_suspended = max(0, len(codes) - n_quoted)
+
+        # --- 分布基数：**过滤前**取快照 --------------------------------
+        # 这是选股页踩过的坑（见 MEMORY §6）：基数一旦跟着筛选链走，
+        # 点掉一个行业之后其余 chip 会一起消失。先快照，再过滤。
+        summary_base = list(dict.fromkeys(quoted_codes))
+        industry_summary = self.industries.summary(summary_base)
+        concept_summary = self.concepts.summary(summary_base)
+
+        # --- 应用行业 / 概念过滤 ----------------------------------------
+        l2_of: Dict[str, Optional[str]] = {
+            c: self.industries.get_l2(c) for c in summary_base
+        }
+        keep = list(summary_base)
+        if industries:
+            want_ind = set(industries)
+            keep = [c for c in keep if l2_of.get(c) in want_ind]
+        if concepts:
+            matched = self.concepts.filter_codes(keep, concepts, mode=concept_mode)
+            keep = [c for c in keep if c in matched]
+        keep_set = set(keep)
+
+        # --- 明细 -------------------------------------------------------
+        cpts_of: Dict[str, List[str]] = {
+            c: self.concepts.get(c, sort_by_size=True) for c in summary_base
+        }
+        # 涨跌停判定要按「锚点日的前收 × 该股自己的涨跌幅限制」算整数分，
+        # 与连板梯队 / 板块成分股同一套口径（limits.py）。
+        lim = self._anchor_limits(anchor)
+        want_cpt = set(concepts)
+        rows: List[Dict[str, Any]] = []
+        src = work[work["code"].isin(keep_set)]
+        for r in src.itertuples(index=False):
+            code = str(r.code)
+            close = float(r.close)
+            ind = self.industries.get(code) or {"l1": None, "l2": None, "l3": None}
+            full_cpts = cpts_of.get(code) or []
+            float_mcap = self.shares.mcap_yi(code, close)
+            limv = lim.get(code, 0)
+            rows.append(
+                {
+                    "code": code,
+                    "symbol": split_code(code)[0],
+                    "name": self.names.get(code),
+                    "market": split_code(code)[1].upper(),
+                    "board": board_of(code),
+                    "industry_l1": ind["l1"],
+                    "industry_l2": ind["l2"],
+                    "industry_l3": ind["l3"],
+                    # 只带前 12 个（按成员数降序）—— 最多的一只有 49 个概念，
+                    # 几百行全量返回会把响应体撑到几 MB，前端也只展示前几个。
+                    "concepts": full_cpts[:12],
+                    "concept_n": len(full_cpts),
+                    "hit_concepts": [c for c in full_cpts if c in want_cpt],
+                    "is_st": is_st_name(self.names.get(code) or ""),
+                    "limit": "涨停" if limv == 1 else ("跌停" if limv == -1 else ""),
+                    "trade_date": anchor_iso,
+                    "close": round(close, 3),
+                    "pct_change": None if pd.isna(r.pct) else round(float(r.pct), 5),
+                    "amount": round(float(r.amount), 0),
+                    "amount_yi": fmt_amount_yi(r.amount),
+                    "volume_hand": round(float(r.volume) / 100.0, 0),
+                    "float_mcap_yi": (
+                        None if float_mcap is None else round(float(float_mcap), 2)
+                    ),
+                }
+            )
+        sorters = {
+            "amount": lambda x: (-(x["amount_yi"] or 0.0), x["code"]),
+            "mcap": lambda x: (-(x["float_mcap_yi"] or 0.0), x["code"]),
+            "pct": lambda x: (-(x["pct_change"] or 0.0), x["code"]),
+            "close": lambda x: (-(x["close"] or 0.0), x["code"]),
+            "concept_n": lambda x: (-x["concept_n"], x["code"]),
+            "industry": lambda x: (x["industry_l2"] or "", x["code"]),
+            "code": lambda x: x["code"],
+            "name": lambda x: (x["name"] or "", x["code"]),
+        }
+        rows.sort(key=sorters.get(sort_key, sorters["amount"]))
+        total = len(rows)
+        rows = rows[:max_rows]
+
+        conditions = [
+            f"自选板块：{block_info['name']}（{block_info['file']}，{len(codes)} 只）",
+            f"锚点交易日 {anchor_iso}",
+            f"当日有行情 {n_quoted} 只"
+            + (f"，停牌 / 未上市 {n_suspended} 只" if n_suspended else ""),
+            f"二级行业：{'、'.join(industries)}" if industries else "不限二级行业",
+            (
+                f"概念（{'同时命中全部' if concept_mode == 'all' else '命中任一'}）："
+                + "、".join(concepts)
+            )
+            if concepts
+            else "不限概念",
+            "剔除 ST / 退市" if exclude_st else "包含 ST",
+            f"成交额 ≥ {fmt_amount_yi(min_amount)} 亿元" if min_amount > 0 else "不限成交额",
+            "板块成分取自本地 blocknew 文件（用户手工维护，随增删而变）"
+            "· 使用本地通达信日线（不复权）",
+        ]
+        warnings: List[str] = []
+        if not industry_summary["groups"]:
+            warnings.append(
+                f"该板块 {len(summary_base)} 只成员在本地行业表里都没有二级行业归属"
+            )
+        if concept_summary["unmapped"]:
+            warnings.append(
+                f"{concept_summary['unmapped']} 只成员在本地板块文件里没有概念归属"
+            )
+        if warnings:
+            warnings.append("工具只做数据统计，不构成任何投资建议")
+
+        base.update(
+            {
+                "candidates": n_quoted,
+                "n_suspended": n_suspended,
+                "summary_base": len(summary_base),
+                "matched": len(keep),
+                "industry_summary": industry_summary,
+                "concept_summary": concept_summary,
+                "industry_missing": industry_summary["unmapped"],
+                "concept_missing": concept_summary["unmapped"],
+                "concept_total": self.concepts.concept_count,
+                "sort": sort_key,
+                "total": total,
+                "truncated": total > len(rows),
+                "rows_count": len(rows),
+                "conditions": conditions,
+                "warnings": warnings,
+                "elapsed": round(time.perf_counter() - t_start, 3),
+                "rows": rows,
+            }
+        )
+        return base
 
     # ------------------------------------------------------------------
     # K 线

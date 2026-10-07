@@ -74,7 +74,34 @@ const state = {
   bpIndexChart: null,       // 板块指数图（主图 + 量 + MACD）
   bpStockChart: null,       // 个股图
   bpLoaded: false,
+
+  /* ---- 自选板块（通达信 T0002/blocknew） ---- */
+  wbCatalog: null,          // /api/watch_blocks 的返回（板块清单）
+  wbKey: '',                // 当前选中的板块 key（.blk 文件名去后缀）
+  wbPanel: null,            // /api/watch_block_panel 的返回
+  wbRows: [],               // 成员股明细（未排序）
+  wbSort: { key: 'amount_yi', dir: 'desc' },
+  wbIndFilter: [],          // 点选的二级行业（服务端过滤）
+  wbCptFilter: [],          // 点选的概念
+  wbCptMode: 'any',
+  wbLoaded: false,
 };
+
+/* 自选板块成员表可排序的列（默认与后端一致：成交额降序） */
+const WB_SORT_COLS = {
+  code:          { type: 'text', get: (r) => r.symbol || r.code },
+  name:          { type: 'text', get: (r) => r.name || '' },
+  industry_l2:   { type: 'text', get: (r) => r.industry_l2 || '' },
+  hit_n:         { type: 'num',  get: (r) => (r.hit_concepts || []).length },
+  concept_n:     { type: 'num',  get: (r) => r.concept_n ?? (r.concepts || []).length },
+  close:         { type: 'num',  get: (r) => r.close },
+  pct_change:    { type: 'num',  get: (r) => r.pct_change },
+  amount_yi:     { type: 'num',  get: (r) => r.amount_yi },
+  float_mcap_yi: { type: 'num',  get: (r) => r.float_mcap_yi },
+  board:         { type: 'text', get: (r) => r.board || '' },
+  limit:         { type: 'text', get: (r) => r.limit || '' },
+};
+const WB_DEFAULT_SORT = { key: 'amount_yi', dir: 'desc' };
 
 /* 结果表可排序的列：get(r) 取排序值；type 决定比较方式与首次点击的方向 */
 const SORT_COLS = {
@@ -2536,6 +2563,445 @@ function bindBoard() {
 }
 
 /* ------------------------------------------------------------------ */
+/* 自选板块（通达信 T0002/blocknew）                                    */
+/* ------------------------------------------------------------------ */
+async function loadWatchBlocks(opts) {
+  const o = opts || {};
+  let d;
+  try {
+    d = await api('/api/watch_blocks');
+  } catch (e) {
+    if (!o.silent) toast('加载自选板块失败：' + e.message, 'err');
+    return null;
+  }
+  if (!d.ok) {
+    if (!o.silent) toast(d.reason || '加载自选板块失败', 'err');
+    return null;
+  }
+  const prevKeys = (state.wbCatalog && state.wbCatalog.blocks)
+    ? state.wbCatalog.blocks.map((b) => b.key) : null;
+  state.wbCatalog = d;
+  const sel = $('#wbSelect');
+  const blocks = d.blocks || [];
+  // 下拉只显示「显示名 · 成员数」：
+  //  - blocknew.cfg 里没改过名的板块，显示名就等于文件名（60-11-14 / GL-12-03 …），
+  //    不再画蛇添足补「（xxx.blk）」—— 文件名对用户没有意义，还会把选项撑破；
+  //  - 成员数为 0 的板块保留在列表里（用户可能刚建好还没加股票），置灰不可选。
+  sel.innerHTML = blocks.map((b) => {
+    const label = b.name || b.key;
+    const count = b.has_members ? String(b.n) : '空';
+    return `<option value="${esc(b.key)}"${b.has_members ? '' : ' disabled'}>`
+      + `${esc(label)} · ${count}</option>`;
+  }).join('');
+  $('#wbCount').textContent = d.total ? String(d.with_members) : '';
+  $('#wbCount').title = `${d.total} 个自选板块（${d.with_members} 个有成分股）`;
+  // 选中项：① 重新扫描时优先保留用户当前选中的那个（只要它还在）；
+  //         ② 否则回落到第一个有成分的板块，省得用户先选一次。
+  const keys = blocks.map((b) => b.key);
+  let want = (o.keep && state.wbKey && keys.includes(state.wbKey)) ? state.wbKey : '';
+  if (!want) {
+    const first = blocks.find((b) => b.has_members) || blocks[0];
+    want = first ? first.key : '';
+  }
+  if (want) {
+    sel.value = want;
+    state.wbKey = want;
+  } else {
+    sel.value = '';
+    state.wbKey = '';
+  }
+  // 重新扫描时告诉用户「这一趟到底有没有变化」——没变化也要有反馈，
+  // 否则用户会以为按钮没生效而反复点。
+  if (o.notify) {
+    if (prevKeys === null) {
+      toast(`已扫描到 ${d.total} 个自选板块`, 'ok');
+    } else {
+      const added = keys.filter((k) => !prevKeys.includes(k));
+      const removed = prevKeys.filter((k) => !keys.includes(k));
+      if (!added.length && !removed.length) {
+        toast(`板块清单无变化（${d.total} 个）`, 'ok');
+      } else {
+        const bits = [];
+        if (added.length) bits.push(`新增 ${added.length} 个：${added.slice(0, 3).join('、')}`
+          + (added.length > 3 ? ' 等' : ''));
+        if (removed.length) bits.push(`移除 ${removed.length} 个：${removed.slice(0, 3).join('、')}`
+          + (removed.length > 3 ? ' 等' : ''));
+        toast(`板块清单已更新（共 ${d.total} 个）· ${bits.join('；')}`, 'ok', 6000);
+      }
+    }
+  }
+  return d;
+}
+
+function wbQuery() {
+  const q = new URLSearchParams({ block: state.wbKey, sort: 'amount', max_rows: '3000' });
+  const date = $('#wbDate').value;
+  if (date) q.set('date', date);
+  if ($('#wbMinAmount').value) q.set('min_amount', String(Number($('#wbMinAmount').value) * 1e8));
+  q.set('exclude_st', $('#wbExcludeSt').checked ? 'true' : 'false');
+  if (state.wbIndFilter.length) q.set('industries', state.wbIndFilter.join(','));
+  if (state.wbCptFilter.length) {
+    q.set('concepts', state.wbCptFilter.join(','));
+    q.set('concept_mode', state.wbCptMode);
+  }
+  return q;
+}
+
+async function loadWatchBlockPanel() {
+  if (!state.wbKey) {
+    const d = await loadWatchBlocks();
+    if (!state.wbKey) { toast('本地没有自选板块（T0002/blocknew）', 'warn'); return; }
+  }
+  let d;
+  try {
+    d = await api('/api/watch_block_panel?' + wbQuery().toString());
+  } catch (e) { toast('加载自选板块失败：' + e.message, 'err'); return; }
+  if (!d.ok) {
+    toast(d.reason || '加载失败', 'err');
+    // 板块本身无效（被用户删了）→ 重新拉一次清单
+    if (d.reason && d.reason.indexOf('未知自选板块') === 0) { state.wbKey = ''; loadWatchBlocks(); }
+    return;
+  }
+  state.wbPanel = d;
+  state.wbRows = d.rows || [];
+  renderWatchBlock();
+}
+
+function renderWatchBlock() {
+  const d = state.wbPanel;
+  if (!d) return;
+  renderWbConditions(d);
+  renderWbKpi(d);
+  renderWbIndSummary(d);
+  renderWbCptSummary(d);
+  renderWbTable();
+}
+
+function renderWbConditions(d) {
+  const b = d.block || {};
+  const bname = b.name || b.key || '';
+  // 只有「显示名 ≠ 文件名」时才补文件名（用户改过名的板块），否则纯属噪音
+  const bfile = b.key && b.key !== bname ? `（${esc(b.key)}）` : '';
+  const items = [
+    `自选板块 <b>${esc(bname)}</b>${bfile} · 成分 <b>${d.n_total ?? 0}</b> 只`,
+    `交易日 <b>${esc(d.date || '-')}</b> · 当日有行情 <b>${d.candidates ?? 0}</b> 只`
+      + (d.n_suspended ? ` · 停牌/未上市 ${d.n_suspended} 只` : ''),
+    (d.industries && d.industries.length)
+      ? `二级行业筛选：${d.industries.map((s) => `<b>${esc(s)}</b>`).join('、')}`
+      : '不限二级行业',
+    (d.concepts && d.concepts.length)
+      ? `概念筛选（${d.concept_mode === 'all' ? '全部命中' : '任一命中'}）：`
+        + d.concepts.map((s) => `<b>${esc(s)}</b>`).join('、')
+      : '不限概念',
+    `命中 <b>${d.matched ?? 0}</b> 只`,
+  ];
+  $('#wbConditions').innerHTML = items.map((t) => `<li>${t}</li>`).join('');
+}
+
+function renderWbKpi(d) {
+  const ix = d.industry_summary || {};
+  const cp = d.concept_summary || {};
+  const items = [
+    { k: '板块成分', v: d.n_total ?? 0, s: 'blocknew 文件静态成员数' },
+    { k: '当日有行情', v: d.candidates ?? 0, s: d.n_suspended ? `停牌/未上市 ${d.n_suspended} 只` : '全部有行情' },
+    {
+      k: '当前命中', v: d.matched ?? 0,
+      cls: d.matched === 0 ? 'warn' : '',
+      s: `占当日有行情 ${d.candidates ? ((d.matched / d.candidates) * 100).toFixed(1) : '0.0'}%`,
+    },
+    { k: '覆盖行业', v: (ix.groups || []).length, s: `个二级行业${ix.unmapped ? ` · ${ix.unmapped} 只无分类` : ''}` },
+    { k: '覆盖概念', v: (cp.groups || []).length, s: `个概念${cp.unmapped ? ` · ${cp.unmapped} 只无分类` : ''}` },
+    { k: '平均概念数', v: cp.avg ?? 0, s: `${cp.tags ?? 0} 个概念归属` },
+  ];
+  $('#wbKpi').innerHTML = items.map((x) => `
+    <div class="kpi ${x.cls || ''}">
+      <div class="k">${esc(x.k)}</div>
+      <div class="v">${typeof x.v === 'number' ? x.v : esc(String(x.v))}</div>
+      <div class="s">${esc(x.s)}</div>
+    </div>`).join('');
+  $('#wbKpiCard').hidden = false;
+}
+
+/* 两个分布卡：基数固定为「该板块当日有行情的成员数」（后端 summary_base），
+   不随行业/概念筛选变化 —— 所以点掉一个 chip 之后其余 chip 仍在，可以连续切换。 */
+function renderWbIndSummary(d) {
+  const card = $('#wbIndCard');
+  const box = $('#wbIndSummary');
+  const ix = d.industry_summary || {};
+  const groups = ix.groups || [];
+  if (!groups.length) { card.hidden = true; box.innerHTML = ''; return; }
+  card.hidden = false;
+  const base = d.summary_base ?? d.matched;
+  const on = new Set(state.wbIndFilter);
+  let top = groups.slice(0, 40);
+  on.forEach((name) => {
+    if (!top.some((g) => g.l2 === name)) {
+      const cur = groups.find((g) => g.l2 === name);
+      if (cur) top = [cur].concat(top);
+    }
+  });
+  $('#wbIndMeta').textContent =
+    `${base} 只有行情，覆盖 ${groups.length} 个二级行业`
+    + (on.size ? ` · 已筛「${[...on].join('、')}」→ ${d.matched} 只` : '')
+    + (ix.unmapped ? ` · ${ix.unmapped} 只无行业分类` : '');
+  box.innerHTML = top.map((g) => `
+    <button class="ind-chip${on.has(g.l2) ? ' active' : ''}"
+            data-l2="${esc(g.l2)}" title="点击按「${esc(g.l2)}」筛选；再点取消">
+      ${esc(g.l2)} <b>${g.n}</b>
+    </button>`).join('')
+    + (groups.length > top.length ? `<span class="ind-more">…另有 ${groups.length - top.length} 个行业</span>` : '');
+}
+
+function renderWbCptSummary(d) {
+  const card = $('#wbCptCard');
+  const box = $('#wbCptSummary');
+  const cp = d.concept_summary || {};
+  const groups = cp.groups || [];
+  if (!groups.length) { card.hidden = true; box.innerHTML = ''; return; }
+  card.hidden = false;
+  const base = d.summary_base ?? d.matched;
+  const on = new Set(state.wbCptFilter);
+  let top = groups.slice(0, 40);
+  on.forEach((name) => {
+    if (!top.some((g) => g.concept === name)) {
+      const cur = groups.find((g) => g.concept === name);
+      if (cur) top = [cur].concat(top);
+    }
+  });
+  $('#wbCptMeta').textContent =
+    `${base} 只有行情，覆盖 ${groups.length} 个概念`
+    + (on.size ? ` · 已筛 ${on.size} 个概念（${state.wbCptMode === 'all' ? '全部命中' : '任一命中'}）→ ${d.matched} 只` : '')
+    + ` · 平均每股 ${cp.avg ?? 0} 个`
+    + (cp.unmapped ? ` · ${cp.unmapped} 只无概念分类` : '');
+  box.innerHTML = top.map((g) => `
+    <button class="ind-chip${on.has(g.concept) ? ' active' : ''}"
+            data-concept="${esc(g.concept)}" title="点击按「${esc(g.concept)}」筛选；再点取消">
+      ${esc(g.concept)} <b>${g.n}</b>
+    </button>`).join('')
+    + (groups.length > top.length ? `<span class="ind-more">…另有 ${groups.length - top.length} 个概念</span>` : '');
+}
+
+function renderWbTable() {
+  const tb = $('#wbTable tbody');
+  if (!tb) return;
+  const rows = state.wbRows || [];
+  const d = state.wbPanel;
+  if (!rows.length) {
+    tb.innerHTML = `<tr><td colspan="11" class="empty">${
+      d ? '当前条件下没有成员股（试试清除筛选）' : '请选择自选板块并点『加载板块』'}</td></tr>`;
+    $('#wbMeta').textContent = '';
+    return;
+  }
+  const order = orderBy(rows, state.wbSort, WB_SORT_COLS);
+  tb.innerHTML = order.map((i) => {
+    const r = rows[i];
+    const hits = r.hit_concepts || [];
+    const all = r.concepts || [];
+    // 没有概念筛选时「命中概念」恒为空，整列都是「—」白占地方 ——
+    // 那种情况改展示该股最主要的几个概念，列的意义就还在。
+    const show = hits.length ? hits : all.slice(0, 3);
+    const hitTitle = hits.length
+      ? `命中概念：${hits.join('、')}`
+      : (all.length ? `全部概念：${all.join('、')}` : '无概念归属');
+    const hitHtml = show.length
+      ? show.slice(0, 3).map((c) => `<span class="cpt">${esc(c)}</span>`).join('')
+        + ((hits.length ? hits.length : all.length) > 3
+          ? `<span class="cpt-more" title="${esc(hitTitle)}">+${(hits.length ? hits.length : all.length) - 3}</span>` : '')
+      : '<span class="hit-empty">—</span>';
+    const indTitle = [r.industry_l1, r.industry_l2, r.industry_l3]
+      .filter(Boolean).join(' / ') || '无行业分类';
+    const tag = r.is_st ? ' <span class="muted">ST</span>' : '';
+    // 涨跌停标记：复用连板页的 tag 风格
+    const lim = r.limit === '涨停' ? '<span class="tag buy">涨停</span>'
+      : (r.limit === '跌停' ? '<span class="tag ok">跌停</span>' : '');
+    return `
+    <tr class="clickable" data-code="${esc(r.code)}">
+      <td class="code">${esc(r.symbol || r.code)}</td>
+      <td><b>${esc(r.name || '')}</b>${tag}</td>
+      <td><span class="ind" title="${esc(indTitle)}">${esc(r.industry_l2 || '—')}</span></td>
+      <td class="hit-cell" title="${esc(hitTitle)}">${hitHtml}</td>
+      <td class="num" title="本地板块文件收录的全部概念：${esc(all.join('、') || '无')}">${r.concept_n ?? 0}</td>
+      <td class="num">${fmt(r.close, 2)}</td>
+      <td class="num ${pctClass(r.pct_change)}">${fmtPct(r.pct_change)}</td>
+      <td class="num">${fmt(r.amount_yi, 2)}</td>
+      <td class="num">${fmt(r.float_mcap_yi, 1)}</td>
+      <td>${esc(r.board || '')}</td>
+      <td>${lim}</td>
+    </tr>`;
+  }).join('');
+  const b = d ? (d.block || {}) : {};
+  $('#wbMeta').textContent =
+    `${rows.length} 只（${b.name || ''} 当日有行情 ${d.candidates ?? 0} 只`
+    + (d.matched !== d.candidates ? `，筛选后 ${d.matched} 只` : '')
+    + '）'
+    + (d.truncated ? ` · 已截断，共 ${d.total} 只` : '');
+}
+
+function updateWbSortUI() {
+  const el = $('#wbSortHint');
+  if (!el) return;
+  const th = document.querySelector(`#wbTable thead th[data-sort="${state.wbSort.key}"]`);
+  const label = th ? (th.dataset.label || state.wbSort.key) : state.wbSort.key;
+  const dir = state.wbSort.dir === 'desc' ? '降序' : '升序';
+  el.textContent = `点行看 K 线 · 排序：${label} ${dir}`;
+  el.title = `点击表头排序，再点同一列反向；当前按「${label}」${dir}`;
+  const btn = $('#wbSortReset');
+  if (btn) {
+    btn.hidden = state.wbSort.key === WB_DEFAULT_SORT.key
+      && state.wbSort.dir === WB_DEFAULT_SORT.dir;
+  }
+}
+
+/* 自选板块成员行复用选股抽屉：先补上抽屉需要的默认值 */
+function openWbDrawer(r) {
+  const sellP = (Number($('#fSellProfit').value) || 4.5) / 100;
+  openDrawer({
+    ...r,
+    signal_date: r.trade_date,
+    buy_price: r.close,
+    sell_price: Number((r.close * (1 + sellP)).toFixed(2)),
+    vol_ratio: null,
+    ma_volume: null,
+    volume: null,
+  });
+}
+
+function exportWbCsv() {
+  const rows = state.wbRows || [];
+  if (!rows.length) { toast('没有可导出的结果', 'warn'); return; }
+  const cols = ['symbol', 'name', 'board', 'industry_l1', 'industry_l2', 'industry_l3',
+    'hit_concepts', 'concepts', 'concept_n', 'trade_date', 'close', 'pct_change',
+    'amount_yi', 'float_mcap_yi'];
+  const head = ['代码', '名称', '板块', '一级行业', '二级行业', '三级行业',
+    '命中概念', '全部概念', '概念数', '交易日', '收盘价', '涨跌幅',
+    '成交额(亿)', '流通市值(亿)'];
+  const cell = (s) => (/[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+  const lines = [head.join(',')];
+  orderBy(rows, state.wbSort, WB_SORT_COLS).forEach((i) => {
+    const r = rows[i];
+    lines.push(cols.map((c) => {
+      if (c === 'concepts') return cell((r.concepts || []).join('、'));
+      if (c === 'hit_concepts') return cell((r.hit_concepts || []).join('、'));
+      const v = r[c];
+      return v === null || v === undefined ? '' : String(v);
+    }).join(','));
+  });
+  const blob = new Blob(['\uFEFF' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const b = state.wbPanel ? (state.wbPanel.block || {}) : {};
+  a.download = `自选板块_${b.name || state.wbKey || 'block'}_${(state.wbPanel && state.wbPanel.date) || 'latest'}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function bindWatchBlock() {
+  // 同板块交集页：元素多，先整体查一遍，缺了就只跳过本页，
+  // 免得一处拼错 id 把后面的绑定全部带停（表现为「其他页签也一起坏了」）。
+  const needed = ['#wbSelect', '#wbDate', '#wbDateLatest', '#wbMinAmount', '#wbExcludeSt',
+    '#btnWbLoad', '#btnWbRescan', '#btnWbClear', '#wbKpiCard', '#wbIndCard', '#wbCptCard',
+    '#wbIndSummary', '#wbCptSummary', '#btnWbIndClear', '#btnWbCptClear', '#wbCptMode',
+    '#wbTable', '#btnWbExport', '#wbSortReset'];
+  const missing = needed.filter((s) => !$(s));
+  if (missing.length) {
+    console.warn('自选板块页元素缺失，已跳过绑定：', missing);
+    return;
+  }
+  $('#btnWbLoad').onclick = loadWatchBlockPanel;
+  // 重新扫描：用户在通达信里改动自选板块之后，不必重启服务、也不必手动刷新页面。
+  // 后端每次请求都会重算指纹；这里保留当前选中的板块，只重画下拉 + 重取面板。
+  $('#btnWbRescan').onclick = async () => {
+    const btn = $('#btnWbRescan');
+    btn.disabled = true;
+    try {
+      const d = await loadWatchBlocks({ keep: true, notify: true });
+      if (d && state.wbKey) await loadWatchBlockPanel();
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  $('#wbSelect').onchange = (e) => {
+    if (e.target.value === state.wbKey) return;
+    state.wbKey = e.target.value;
+    // 换板块＝整个成员集都换了，筛选与排序先复位，免得挂着上一个板块的条件
+    state.wbIndFilter = [];
+    state.wbCptFilter = [];
+    loadWatchBlockPanel();
+  };
+  $('#wbDate').onchange = (e) => { snapTradeDate(e.target, { notify: true }); loadWatchBlockPanel(); };
+  $('#wbDateLatest').onclick = () => { $('#wbDate').value = ''; loadWatchBlockPanel(); };
+  $('#wbMinAmount').onchange = loadWatchBlockPanel;
+  $('#wbExcludeSt').onchange = loadWatchBlockPanel;
+  $('#wbCptMode').onchange = (e) => {
+    state.wbCptMode = e.target.value;
+    if (state.wbCptFilter.length) loadWatchBlockPanel();
+  };
+  $('#btnWbClear').onclick = () => {
+    if (!state.wbIndFilter.length && !state.wbCptFilter.length
+        && !$('#wbMinAmount').value && !$('#wbDate').value) {
+      toast('当前没有筛选条件', 'warn');
+      return;
+    }
+    state.wbIndFilter = [];
+    state.wbCptFilter = [];
+    $('#wbMinAmount').value = '0';
+    $('#wbDate').value = '';
+    loadWatchBlockPanel();
+  };
+
+  // chip 点击 = 切换该行业/概念的选中态，然后重算（服务端过滤，保证与分布卡同口径）
+  $('#wbIndSummary').addEventListener('click', (ev) => {
+    const chip = ev.target.closest('.ind-chip');
+    if (!chip) return;
+    const name = chip.dataset.l2;
+    const i = state.wbIndFilter.indexOf(name);
+    if (i >= 0) state.wbIndFilter.splice(i, 1);
+    else state.wbIndFilter.push(name);
+    loadWatchBlockPanel();
+  });
+  $('#wbCptSummary').addEventListener('click', (ev) => {
+    const chip = ev.target.closest('.ind-chip');
+    if (!chip) return;
+    const name = chip.dataset.concept;
+    const i = state.wbCptFilter.indexOf(name);
+    if (i >= 0) state.wbCptFilter.splice(i, 1);
+    else state.wbCptFilter.push(name);
+    loadWatchBlockPanel();
+  });
+  $('#btnWbIndClear').onclick = () => {
+    if (!state.wbIndFilter.length) { toast('当前未设置行业筛选', 'warn'); return; }
+    state.wbIndFilter = [];
+    loadWatchBlockPanel();
+  };
+  $('#btnWbCptClear').onclick = () => {
+    if (!state.wbCptFilter.length) { toast('当前未设置概念筛选', 'warn'); return; }
+    state.wbCptFilter = [];
+    loadWatchBlockPanel();
+  };
+
+  bindSortHead('#wbTable', state.wbSort, WB_SORT_COLS, () => {
+    paintSortHeaders('#wbTable', state.wbSort);
+    updateWbSortUI();
+    renderWbTable();
+  });
+  paintSortHeaders('#wbTable', state.wbSort);
+  updateWbSortUI();
+  $('#wbSortReset').onclick = () => {
+    state.wbSort = { ...WB_DEFAULT_SORT };
+    paintSortHeaders('#wbTable', state.wbSort);
+    updateWbSortUI();
+    renderWbTable();
+  };
+  $('#wbTable').addEventListener('click', (ev) => {
+    const tr = ev.target.closest('tr[data-code]');
+    if (!tr) return;
+    const row = state.wbRows.find((r) => r.code === tr.dataset.code);
+    if (row) openWbDrawer(row);
+  });
+  $('#btnWbExport').onclick = exportWbCsv;
+}
+
+/* ------------------------------------------------------------------ */
 /* 初始化                                                              */
 /* ------------------------------------------------------------------ */
 const VIEW_META = {
@@ -2554,6 +3020,10 @@ const VIEW_META = {
   board: {
     title: '板块看盘',
     sub: '顶部 tab 切「概念板块 / 行业板块」（本地有成分的两类，来源于通达信板块指数表）· 涨幅 / 成交额 / 量比 / 成分涨跌家数 · 上下两栏联动，左看板块右看成分股',
+  },
+  watchblock: {
+    title: '自选板块',
+    sub: '读通达信 T0002/blocknew 的自选板块（你自己维护的那批）· 成员股做二级行业 / 概念映射 · 点分布标签即筛选，基数不随筛选变化 · 点行看 K 线',
   },
   plan: {
     title: '计划',
@@ -2591,6 +3061,28 @@ function switchTab(name) {
   if (name === 'streak') {
     if (!state.streak) loadStreaks();
     else if (state.streakChart) setTimeout(() => state.streakChart.resize(), 80);
+  }
+  // 自选板块：**每次切过来都重扫清单**（后端每次请求都会重算源文件指纹，
+  // 0.34ms），这样在通达信里新建 / 改名 / 删掉自选板块之后，只要回到本页
+  // 就能看到最新结果 —— 不必重启服务、也不必手动点「重新扫描板块」。
+  // 首次进入才顺带取面板；后续切回来只在「选中项已失效」时重取，避免白跑。
+  if (name === 'watchblock') {
+    // 「首次」以**面板是否已存在**为准，而不是只看 wbLoaded 标志：
+    // init() 末尾会后台预取一次清单+面板，那时 wbLoaded 还是 false，
+    // 若只看标志就会把预取过的面板当首次、白跑一趟。
+    const first = !state.wbPanel;
+    state.wbLoaded = true;
+    loadWatchBlocks({ keep: !first, notify: false })
+      .then((d) => {
+        if (!d) return null;
+        if (first || !state.wbPanel) return loadWatchBlockPanel();
+        // 之前选中的板块被删了 → 面板要跟着换成新的选中项
+        if (state.wbPanel.block && state.wbPanel.block.key !== state.wbKey) {
+          return loadWatchBlockPanel();
+        }
+        return null;
+      })
+      .catch((e) => toast('加载自选板块失败：' + e.message, 'err'));
   }
   if (state.klineChart) setTimeout(() => state.klineChart.resize(), 80);
 }
@@ -2665,6 +3157,8 @@ async function init() {
   $('#staleReload').onclick = () => location.reload();
   // ---- 板块看盘 ----
   bindBoard();
+  // ---- 自选板块 ----
+  bindWatchBlock();
   window.addEventListener('resize', () => {
     if (state.klineChart) state.klineChart.resize();
     if (state.streakChart) state.streakChart.resize();
@@ -2700,6 +3194,13 @@ async function init() {
     loadPlans().catch(() => {});      // 计划 / 追踪也一并预取，切页即见
     loadWatch().catch(() => {});
   }
+
+  // 自选板块也后台预取：不阻塞首屏（放到最后一个 await 之后），
+  // 用户第一次点过去时下拉与面板已经就绪，不会看到一下空白。
+  // 预取失败无所谓 —— switchTab 切过去时还会再扫一次。
+  loadWatchBlocks({ keep: false, silent: true })
+    .then((d) => { if (d && state.wbKey) return loadWatchBlockPanel(); return null; })
+    .catch(() => {});
 }
 
 document.addEventListener('DOMContentLoaded', init);
