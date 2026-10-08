@@ -39,6 +39,7 @@ const state = {
   klineChart: null,
   klineBias: true,      // 偏离度附图默认显示（抽屉顶部可关）
   klineBiasMa: true,    // 量能乖离附图默认显示（抽屉顶部可关）
+  klineLegend: null,    // 抽屉图例里被用户点掉的项 {名称: false}，跨个股保留
   pollTimer: null,
   industries: [],       // 全部二级行业名
   industryTree: {},     // 一级 -> [二级]
@@ -2051,7 +2052,19 @@ async function loadKline() {
   const bma = d.bias_ma || {};
   const showBiasMa = !!(bma.gl20 && bma.gl20.some((v) => v != null)) && state.klineBiasMa !== false;
 
-  if (!state.klineChart) state.klineChart = echarts.init($('#klineChart'));
+  if (!state.klineChart) {
+    state.klineChart = echarts.init($('#klineChart'));
+    /* 图例勾选与「偏离度 / 量能乖离」勾选框一样是**持久偏好**：换一只股票不清空。
+       只记「被关掉」的项，未记录的一律按显示处理（这样新加的图例项默认可见）。 */
+    state.klineChart.on('legendselectchanged', (e) => {
+      if (!e || !e.selected) return;
+      const off = {};
+      Object.keys(e.selected).forEach((k) => {
+        if (e.selected[k] === false) off[k] = false;
+      });
+      state.klineLegend = off;
+    });
+  }
   const chart = state.klineChart;
   // 附图开关会改变栅格布局：容器高度必须跟着变，否则 ECharts 算出来的
   // grid 会超出画布（表现为最下面那栏被裁掉，是**静默失败**）。
@@ -2113,6 +2126,17 @@ async function loadKline() {
   const biasPane = showBias ? 2 : -1;
   const bmaPane = showBiasMa ? (showBias ? 3 : 2) : -1;
 
+  /* 图例项：主图均线 + 两个附图（附图关掉时它的名字不出现在列表里）。
+     用户点掉的项要跨个股保留，所以这里按 state.klineLegend 回填；不在本次
+     列表里的名字不回填，否则关掉附图再打开时会把已经消失的项又带进来。 */
+  const legendNames = ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '20日均量']
+    .concat(showBias ? ['T', 'M5', 'M20'] : [])
+    .concat(showBiasMa ? ['GLXS', 'GL20', 'SMOOTH', 'VMA20'] : []);
+  const legendSelected = {};
+  Object.keys(state.klineLegend || {}).forEach((n) => {
+    if (legendNames.includes(n)) legendSelected[n] = false;
+  });
+
   const option = {
     animation: false,
     backgroundColor: 'transparent',
@@ -2120,9 +2144,8 @@ async function loadKline() {
     legend: {
       top: 4, left: 8, itemGap: 14,
       textStyle: { color: C.muted }, inactiveColor: '#48484a',
-      data: ['K线', 'MA5', 'MA10', 'MA20', 'MA60', '20日均量']
-        .concat(showBias ? ['T', 'M5', 'M20'] : [])
-        .concat(showBiasMa ? ['GLXS', 'GL20', 'SMOOTH', 'VMA20'] : []),
+      data: legendNames,
+      selected: legendSelected,
     },
     tooltip: {
       trigger: 'axis', axisPointer: { type: 'cross' },
