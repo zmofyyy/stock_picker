@@ -346,6 +346,45 @@ def screen(params: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any
         raise HTTPException(500, f"选股失败：{exc}") from exc
 
 
+# ----------------------------------------------------------------------
+# 通达信策略（tqcenter 公式引擎）
+# ----------------------------------------------------------------------
+@app.get("/api/tdx_status")
+def tdx_status() -> Dict[str, Any]:
+    """通达信公式引擎可用性：客户端是否在运行、SDK 与 DLL 是否找到。"""
+    return service.tdx_status()
+
+
+@app.get("/api/tdx_formulas")
+def tdx_formulas(
+    formula_type: int = Query(
+        1, ge=0, le=2, alias="type",
+        description="0 技术指标 / 1 条件选股 / 2 专家系统（默认条件选股）",
+    ),
+) -> Dict[str, Any]:
+    """通达信公式清单，含每个公式的参数名 / 范围 / 默认值与输出线名。
+
+    这些参数是**必填**的：实测 ``MA买入`` 不传参数时全市场 0 命中，
+    传默认值 ``5,20`` 才有结果，所以前端按 ``paras`` 预填。
+    """
+    return service.tdx_formulas(ftype=formula_type)
+
+
+@app.post("/api/tdx_screen")
+def tdx_screen(params: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+    """用通达信条件选股公式选股。
+
+    请求体：``{"formula": "UPN", "args": "3", ...其余与 /api/screen 同参数}``。
+    命中名单交给与本地筛选**同一条**展示管线（板块 / 市值 / ST / 行业 / 概念
+    过滤 + 分布卡 + 明细行），因此返回结构与 ``/api/screen`` 一致，
+    额外多一个 ``engine`` 字段说明公式、参数、信号日与耗时。
+    """
+    try:
+        return service.tdx_screen(params or {})
+    except Exception as exc:
+        raise HTTPException(500, f"通达信公式选股失败：{exc}") from exc
+
+
 @app.get("/api/streaks")
 def streaks(
     date: Optional[str] = Query(None, description="交易日 YYYY-MM-DD；留空 = 最新交易日"),

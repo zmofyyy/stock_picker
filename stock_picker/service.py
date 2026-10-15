@@ -29,6 +29,7 @@ from .limits import (
 from .names import NameIndex
 from .shares import FloatShareIndex
 from .divfactor import DivFactorIndex, build_factor_series
+from .tdx_formula import FORMULA_TYPES, TYPE_LABELS, TdxFormula, TdxFormulaError
 from .watchblocks import WatchBlockIndex
 from .tdx_reader import (
     BARS_COLUMNS,
@@ -176,6 +177,10 @@ class MarketService:
         self._lock = threading.RLock()
         # 重建缓存可能同时来自「启动预加载」和用户手点「刷新数据」，串行化避免并发写 parquet
         self._refresh_lock = threading.Lock()
+        #: 通达信量化公式引擎（tqcenter）。按需懒建 —— 它要求 TdxW.exe 正在运行，
+        #: 所以不在启动时连接，只有真正点开「通达信策略」时才建。
+        self._tdx_formula: Optional[TdxFormula] = None
+        self._tdx_formula_key: Optional[tuple] = None
 
     # ------------------------------------------------------------------
     # 缓存
@@ -803,6 +808,11 @@ class MarketService:
         target_date = params.get("date")
         sell_profit = float(params.get("sell_profit") or plan_cfg.get("sell_profit", 0.045))
         buy_discount = float(params.get("buy_discount") or plan_cfg.get("buy_discount", 0.0))
+        #: ``codes`` = 外部（通达信公式引擎）给定的命中白名单。给了它就**不做量比
+        #: 筛选** —— 策略本身就是条件，量比只作展示列；市值/ST/行业/概念/板块等
+        #: 过滤照旧生效，于是「通达信策略」与「本地筛选」共用同一条展示管线。
+        whitelist_codes = params.get("codes")
+        formula_label = str(params.get("formula_name") or params.get("formula") or "")
 
         df = self.bars()
         if len(df) == 0:
@@ -878,10 +888,22 @@ class MarketService:
         if min_amount > 0 and len(work):
             work = work[work["amount"] >= min_amount]
 
-        hit = work[work["vol_ratio"] >= ratio]
-        hit = hit[hit["ma_vol"].notna() & (hit["volume"] > 0)]
+        if whitelist_codes is not None:
+            wanted_codes = {str(c) for c in whitelist_codes}
+            hit = work[work["code"].isin(wanted_codes)]
+            if len(hit):
+                hit = hit[hit["volume"] > 0]
+        else:
+            hit = work[work["vol_ratio"] >= ratio]
+            hit = hit[hit["ma_vol"].notna() & (hit["volume"] > 0)]
 
-        if exclude_st:
+        if not len(hit):
+            # 空表继续走下面的过滤链会踩 pandas 的坑：对空 Series 取反后 dtype
+            # 不是 bool，``hit[掩码]`` 会被当成**按标签选列**，返回一个无列的空表，
+            # 之后 hit["code"] 就 KeyError。这里换成「带列的空表」。
+            hit = work.iloc[0:0]
+
+        if exclude_st and len(hit):
             names_map = {c: self.names.get(c) for c in hit["code"].unique()}
             hit = hit[
                 ~hit["code"].map(lambda c: is_st_or_delisting(names_map.get(c) or ""))
@@ -907,7 +929,7 @@ class MarketService:
 
         # 二级行业过滤（通达信研究行业）
         industry_missing = 0
-        if industries:
+        if industries and len(hit):
             wanted = set(industries)
             l2map = {c: self.industries.get_l2(c) for c in hit["code"].unique()}
             keep = hit["code"].map(l2map)
@@ -916,17 +938,19 @@ class MarketService:
 
         # 概念过滤（通达信概念板块，本地 infoharbor_block.dat）
         concept_missing = 0
-        if concepts:
+        if concepts and len(hit):
             uniq = hit["code"].unique().tolist()
             keep_codes = self.concepts.filter_codes(uniq, concepts, mode=concept_mode)
             concept_missing = sum(1 for c in uniq if not self.concepts.get(c))
             hit = hit[hit["code"].isin(keep_codes)]
 
-        hit = hit.sort_values("vol_ratio", ascending=False)
+        # 本地筛选按量比降序；公式选股没有量比语义，按涨幅降序更直观
+        sort_col = "pct" if whitelist_codes is not None else "vol_ratio"
+        hit = hit.sort_values(sort_col, ascending=False)
 
         # 每只股票只保留最近一次信号
         hit = hit.sort_values(["code", "date"]).drop_duplicates(subset=["code"], keep="last")
-        hit = hit.sort_values("vol_ratio", ascending=False)
+        hit = hit.sort_values(sort_col, ascending=False)
         total_hits = int(len(hit))
         # 行业 / 概念分布按「基数」统计：不受行业/概念筛选影响，也不是截取后的前 N 只
         industry_summary = self.industries.summary(summary_codes)
@@ -989,10 +1013,15 @@ class MarketService:
                 }
             )
 
+        first_cond = (
+            f"通达信公式：{formula_label or '（未命名）'} → 命中 {len(wanted_codes)} 只"
+            if whitelist_codes is not None
+            else f"成交量 ≥ {ratio:g} × 前 {ma_window} 日均量"
+        )
         return {
             "ok": True,
             "conditions": [
-                f"成交量 ≥ {ratio:g} × 前 {ma_window} 日均量",
+                first_cond,
                 window_desc,
                 f"至少 {min_bars} 根 K 线",
                 f"成交额 ≥ {fmt_amount_yi(min_amount)} 亿元" if min_amount > 0 else "不限成交额",
@@ -1063,6 +1092,188 @@ class MarketService:
             "rows": rows,
             "rows_count": len(rows),
         }
+
+    # ------------------------------------------------------------------
+    # 通达信策略（tqcenter 公式引擎）
+    # ------------------------------------------------------------------
+    def tdx_engine(self) -> TdxFormula:
+        """按配置构建/复用公式引擎实例；``tdx_quant`` 配置变了就重建。"""
+        cfg = self.config.section("tdx_quant")
+        key = (
+            str(self.config.get("tdx_dir") or ""),
+            str(cfg.get("sdk_dir") or ""),
+            str(cfg.get("dll_path") or ""),
+            int(cfg.get("window") or cfg.get("count") or 500),
+            int(cfg.get("dividend_type") if cfg.get("dividend_type") is not None else 1),
+            int(cfg.get("max_window") or 500),
+        )
+        with self._lock:
+            if self._tdx_formula is not None and self._tdx_formula_key == key:
+                return self._tdx_formula
+            if self._tdx_formula is not None:
+                try:
+                    self._tdx_formula.close()
+                except Exception:
+                    pass
+            self._tdx_formula = TdxFormula(
+                tdx_dir=key[0],
+                sdk_dir=key[1],
+                dll_path=key[2],
+                window=key[3],
+                dividend_type=key[4],
+                max_window=key[5],
+            )
+            self._tdx_formula_key = key
+            return self._tdx_formula
+
+    def tdx_status(self) -> Dict[str, Any]:
+        """公式引擎可用性（客户端没开时也能安全返回）。"""
+        cfg = self.config.section("tdx_quant")
+        enabled = bool(cfg.get("enabled", True))
+        eng = self.tdx_engine()
+        try:
+            info = eng.available()
+        except Exception as exc:  # 极端情况下连文件都不存在
+            info = {"ok": False, "connected": False, "reason": str(exc),
+                    "sdk_dir": str(eng.sdk_dir), "dll_path": str(eng.dll_path),
+                    "sdk_present": False}
+        info["enabled"] = enabled
+        # 回看窗口要暴露给前端：可选「信号日」的范围就是这个窗口
+        eng_cfg = self.tdx_engine()
+        info["window"] = eng_cfg.window
+        info["max_window"] = eng_cfg.max_window
+        if not enabled:
+            info["ok"] = False
+            info["reason"] = "已在配置里关闭通达信公式引擎（tdx_quant.enabled = false）"
+        else:
+            info["ok"] = bool(info.get("ok"))
+        return info
+
+    def tdx_formulas(self, ftype: int = FORMULA_TYPES["xg"]) -> Dict[str, Any]:
+        """列出通达信公式（默认条件选股），并带上每个公式的参数定义。
+
+        ``formula_get_info`` 全量 109 个实测 0.43s，所以一次全给前端，
+        省掉「选中后再拉参数」的一次往返。
+        """
+        ftype = int(ftype)
+        cfg = self.config.section("tdx_quant")
+        if not bool(cfg.get("enabled", True)):
+            return {"ok": False, "reason": "通达信公式引擎已在配置里关闭",
+                    "formulas": [], "count": 0, "engine": self.tdx_status()}
+        eng = self.tdx_engine()
+        try:
+            items = eng.formulas(ftype)
+            out: List[Dict[str, Any]] = []
+            for it in items:
+                d = eng.describe(it["code"], ftype)
+                d["is_sys"] = bool(it.get("is_sys"))
+                out.append(d)
+        except TdxFormulaError as exc:
+            return {"ok": False, "reason": str(exc), "formulas": [], "count": 0,
+                    "engine": self.tdx_status()}
+        except Exception as exc:
+            return {"ok": False, "reason": f"读取公式列表失败：{exc}", "formulas": [],
+                    "count": 0, "engine": self.tdx_status()}
+        return {
+            "ok": True,
+            "type": ftype,
+            "type_label": TYPE_LABELS.get(ftype, ""),
+            "count": len(out),
+            "formulas": out,
+            "engine": self.tdx_status(),
+        }
+
+    def tdx_screen(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """通达信公式选股，再套用与「本地筛选」完全一致的过滤与展示管线。
+
+        :param params: ``formula``（公式代码，必填）/ ``args``（公式参数，
+            ``"5,10"`` 或 ``[5,10]``，留空 = 用公式自带默认值）/ ``signal_date``
+            （目标信号日 ``2026-10-09`` 或 ``20261009``；留空 = 最新交易日）/
+            ``window``（回看交易日数，默认取配置），其余键原样透传给
+            :meth:`screen`（``boards`` / ``markets`` / ``exclude_st`` /
+            ``min_amount`` / ``max_float_mcap`` / ``industries`` /
+            ``concepts`` / ``max_results`` …）。
+
+        ``date`` 以**公式实际取值的那个信号日**为准 —— 公式算的是截面，
+        指定历史日期时是靠窗口内的点来定位（见 :meth:`TdxFormula.run_xg`），
+        若拿它去匹配另一个交易日的历史行，语义就错了。
+        """
+        cfg = self.config.section("tdx_quant")
+        formula = str(params.get("formula") or params.get("formula_code") or "").strip()
+        if not formula:
+            return {"ok": False, "reason": "未指定通达信公式", "rows": [], "matched": 0}
+        if not bool(cfg.get("enabled", True)):
+            return {"ok": False, "reason": "通达信公式引擎已在配置里关闭",
+                    "rows": [], "matched": 0, "engine": self.tdx_status()}
+
+        eng = self.tdx_engine()
+        t_start = time.perf_counter()
+        try:
+            res = eng.run_xg(
+                formula,
+                params.get("args"),
+                window=params.get("window") or None,
+                signal_date=params.get("signal_date") or params.get("date") or "",
+            )
+        except TdxFormulaError as exc:
+            return {"ok": False, "reason": str(exc), "rows": [], "matched": 0,
+                    "engine": self.tdx_status()}
+        except Exception as exc:
+            return {"ok": False, "reason": f"公式执行失败：{exc}", "rows": [], "matched": 0,
+                    "engine": self.tdx_status()}
+        if not res.get("ok"):
+            # 失败也要把窗口边界带出去 —— 前端据此把「信号日」控件的 min/max
+            # 摆正，用户才知道能选到哪天（例如选了窗口外的早期日期时）。
+            fail_engine = self.tdx_status()
+            fail_engine.update({
+                "formula": formula,
+                "window": res.get("window"),
+                "date_start": res.get("window_start") or "",
+                "date_end": res.get("window_end") or "",
+            })
+            return {"ok": False, "reason": res.get("reason") or "公式执行失败",
+                    "rows": [], "matched": 0, "engine": fail_engine}
+
+        codes = [h["code"] for h in res["hits"]]
+        # run_xg 已统一输出 ISO，别再二次转换
+        formula_date = str(res.get("date") or "")
+        engine = {
+            "formula": res["formula"],
+            "formula_name": res["formula_name"],
+            "args": res["args"],
+            "hits": res["total"],
+            "scanned": res["scanned"],
+            "date": formula_date,
+            "elapsed": res["elapsed"],
+            "window": res.get("window"),
+            # 窗口覆盖的交易日区间 → 前端拿它当「信号日」控件的 min/max
+            "date_start": res.get("window_start") or "",
+            "date_end": res.get("window_end") or "",
+            "date_requested": str(res.get("date_requested") or ""),
+            "date_hits": res.get("date_hits") or {},
+        }
+
+        sp = dict(params)
+        sp["codes"] = codes
+        sp["formula"] = formula
+        sp["formula_name"] = res["formula_name"]
+        notice = str(res.get("date_adjusted") or "")
+        if formula_date:
+            sp["date"] = formula_date
+
+        out = self.screen(sp)
+        out["engine"] = engine
+        out["tdx_notice"] = notice
+        out["screen_elapsed"] = round(time.perf_counter() - t_start, 3)
+        if not out.get("ok"):
+            out["engine"] = engine
+            if out.get("date_out_of_range"):
+                out["reason"] = (
+                    f"公式信号日 {formula_date} 不在本地行情缓存里"
+                    f"（缓存范围 {out.get('date_min')} ~ {out.get('date_max')}）；"
+                    "请点右上角『刷新数据』重建缓存后重试"
+                )
+        return out
 
     # ------------------------------------------------------------------
     # 连板梯队

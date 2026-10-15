@@ -108,6 +108,73 @@
     <main>
       <!-- ============ 选股 ============ -->
       <section class="panel active" id="panel-screen">
+        <div class="bp-tabs-row">
+          <div class="bp-tabs" id="stTabs" role="tablist" aria-label="选股模式">
+            <button class="bp-tab active" data-st="tdx" role="tab" aria-selected="true">通达信策略</button>
+            <button class="bp-tab" data-st="local" role="tab" aria-selected="false">本地筛选</button>
+          </div>
+          <span class="bp-tabs-note" id="stNote">调用通达信客户端内置的条件选股公式，需先启动客户端（TdxW.exe）</span>
+        </div>
+
+        <!-- ============ 通达信策略：选公式 → 设参数 → 执行 ============ -->
+        <div id="stPaneTdx">
+          <div class="card">
+            <div class="filters">
+              <label class="st-wide">选股公式
+                <span class="tdx-field">
+                  <select id="tFormulaSel" title="通达信条件选股公式（系统公式 + 自定义公式）"></select>
+                  <button type="button" class="mini" id="tReload" title="重新向客户端拉取公式清单">刷新</button>
+                </span>
+              </label>
+              <label>信号日
+                <span class="date-field">
+                  <input type="date" id="tDate" title="留空＝最新交易日；只能在「回看窗口」覆盖的交易日里选" />
+                  <button type="button" class="mini" id="tDateLatest" title="清除，回到最新交易日">最新</button>
+                </span>
+              </label>
+              <label>回看窗口
+                <input type="number" id="tWindow" value="500" min="1" max="500" step="1"
+                       title="公式回看多少根日线；「信号日」的可选范围就是它覆盖的交易日（越大越慢）" />
+              </label>
+              <label>最小成交额(亿)
+                <input type="number" id="tMinAmount" value="0" step="0.5" min="0" />
+              </label>
+              <label>最大流通市值(亿)
+                <input type="number" id="tMaxFloatMcap" value="150" step="10" min="0" title="0 = 不限" />
+              </label>
+              <label>交易所
+                <span class="mk-group">
+                  <span class="mk"><input type="checkbox" class="tMk" value="sh" checked /> 沪</span>
+                  <span class="mk"><input type="checkbox" class="tMk" value="sz" checked /> 深</span>
+                  <span class="mk"><input type="checkbox" class="tMk" value="bj" checked /> 京</span>
+                </span>
+              </label>
+              <label>板块
+                <span class="mk-group">
+                  <span class="mk"><input type="checkbox" class="tBd" value="主板" checked /> 主板</span>
+                  <span class="mk"><input type="checkbox" class="tBd" value="创业板" /> 创业板</span>
+                  <span class="mk"><input type="checkbox" class="tBd" value="科创板" /> 科创板</span>
+                  <span class="mk"><input type="checkbox" class="tBd" value="北交所" /> 北交所</span>
+                </span>
+              </label>
+              <label class="chk"><input type="checkbox" id="tExcludeSt" checked /> 剔除 ST/退市</label>
+              <label>最多返回
+                <input type="number" id="tMaxResults" value="300" min="1" max="2000" />
+              </label>
+              <button class="btn primary" id="btnTdxScreen">执行策略</button>
+            </div>
+            <div class="tdx-params" id="tParams"></div>
+            <!-- 本页唯一的取数触发点是「执行策略」按钮：改了公式 / 信号日 / 窗口 /
+                 参数只会落一条「待执行」提示，不会自动重跑公式（一次全市场
+                 500 根 ≈ 12s，还独占引擎锁）。 -->
+            <div class="tdx-stale" id="tStale" hidden></div>
+            <div class="tdx-engine" id="tEngine" hidden></div>
+            <ul class="conditions" id="tConditions"></ul>
+          </div>
+        </div>
+
+        <!-- ============ 本地筛选：原有条件全部保留 ============ -->
+        <div id="stPaneLocal" hidden>
         <div class="card">
           <div class="filters">
             <label>均量窗口
@@ -172,10 +239,12 @@
           </div>
           <ul class="conditions" id="conditions"></ul>
         </div>
+        </div>
+        <!-- /stPaneLocal -->
 
         <div class="card" id="indSummaryCard" hidden>
           <div class="card-head">
-            <h2>二级行业分布 <span class="muted" id="indSummaryMeta" title="分布基数是当前其他条件命中的股票数，不受行业/概念筛选影响；点标签即筛选，再点取消"></span></h2>
+            <h2>二级行业分布 <span class="muted" id="indSummaryMeta" title="分布基数是当前其他条件命中的股票数，不受行业/概念筛选影响；点标签即筛选，再点取消。通达信策略下只在已取回的结果上收敛，不会重跑公式"></span></h2>
             <button class="btn small" id="btnIndClear">清除行业筛选</button>
           </div>
           <div class="ind-summary" id="indSummary"></div>
@@ -183,7 +252,7 @@
 
         <div class="card" id="conceptSummaryCard" hidden>
           <div class="card-head">
-            <h2>概念分布 <span class="muted" id="conceptSummaryMeta" title="分布基数是当前其他条件命中的股票数，不受行业/概念筛选影响；点标签即筛选，再点取消"></span></h2>
+            <h2>概念分布 <span class="muted" id="conceptSummaryMeta" title="分布基数是当前其他条件命中的股票数，不受行业/概念筛选影响；点标签即筛选，再点取消。通达信策略下只在已取回的结果上收敛，不会重跑公式"></span></h2>
             <button class="btn small" id="btnConceptClear">清除概念筛选</button>
           </div>
           <div class="ind-summary" id="conceptSummary"></div>

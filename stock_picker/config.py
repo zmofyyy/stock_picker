@@ -43,11 +43,25 @@ CACHE_DIR = DATA_DIR / "cache"
 DEFAULT_CONFIG_FILE = APP_DIR / "config.json"
 
 DEFAULTS: Dict[str, Any] = {
-    "tdx_dir": r"D:\new_tdx",
+    "tdx_dir": r"D:\new_tdx64",
     "host": "127.0.0.1",
     "port": 8778,
     "reader_mode": "fast",
     "names_csv": "",
+    # 通达信量化公式引擎（PYPlugins/sys/tqcenter.py + TPythClient.dll）。
+    # 需要对应版本的 TdxW.exe **正在运行**，且客户端已下载盘后数据。
+    "tdx_quant": {
+        "enabled": True,
+        "sdk_dir": "",      # 留空 = <tdx_dir>/PYPlugins/sys
+        "dll_path": "",     # 留空 = <tdx_dir>/PYPlugins/TPythClient.dll
+        # 回看窗口（交易日）= 喂给公式的 K 线根数 = 每股返回的点数。
+        # 「信号日」只能在这个窗口内选：窗口越大越慢、RPC 载荷越大。
+        # 全市场实测：window=500 → 11.5s，覆盖约 2 年；window=30 → 5.4s，约 6.5 周。
+        "window": 500,
+        "max_window": 500,  # 前端「回看」输入框与接口的上限
+        "dividend_type": 1, # 0 不复权 / 1 前复权 / 2 后复权
+        "timeout_warn": 30, # 单次选股超过该秒数在返回里给出提示
+    },
     "screen": {
         "ma_window": 20,
         "volume_ratio": 2.0,
@@ -70,7 +84,9 @@ DEFAULTS: Dict[str, Any] = {
     "bootstrap": {
         "preload": True,          # 启动即在后台把本地已存在的数据全部载入
         "refresh_if_stale": True, # 本地行情比缓存新时自动重建缓存
-        "auto_screen": True,      # 页面打开后自动跑一次选股（不用手点）
+        # 只作用于「本地筛选」模式。**通达信策略永远不自动取数** ——
+        # 打开页面 / 换公式 / 改信号日都只标「待执行」，必须点「执行策略」。
+        "auto_screen": True,
     },
     "notify": {"console": True},
 }

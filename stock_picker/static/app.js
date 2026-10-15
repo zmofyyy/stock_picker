@@ -53,6 +53,14 @@ const state = {
   tradeDateSet: null,   // 同上，用于 O(1) 判断某天是否交易日
   assetVersion: null,   // 页面加载时后端的前端资源指纹（用于发现「本页已过期」）
   sort: { key: 'vol_ratio', dir: 'desc' },   // 结果表排序（默认与后端一致：量比降序）
+  screenMode: 'tdx',    // 选股页模式：'tdx' 通达信策略 / 'local' 本地筛选
+  screenResult: { tdx: null, local: null },  // 两种模式各自的结果快照，切 tab 时互不串
+  tdxFormulas: [],      // 通达信条件选股公式清单（含参数名/范围/默认值）
+  tdxFormula: '',       // 当前选中的公式代码
+  tdxEngine: null,      // 最近一次公式引擎回执（公式名/参数/信号日/耗时）
+  tdxWindow: 500,       // 公式回看窗口（交易日）=「信号日」的可选范围
+  tdxMaxWindow: 500,    // 窗口输入框上限（来自后端配置）
+  tdxStale: false,      // 控件改过但还没点「执行策略」（结果表里还是上一次的数据）
 
   /* ---- 连板梯队 ---- */
   streak: null,             // 最近一次 /api/streaks 的完整返回
@@ -290,6 +298,8 @@ async function loadTradeDates() {
       el.max = last;
       el.title = tip;
     });
+    // 通达信策略的「信号日」另算：只能落在公式回看窗口内
+    applyTdxDateBounds();
     // 数据刷新后，原先选中的日期可能已越界 → 自动纠正
     snapTradeDate(input, { notify: true });
   } catch { /* ignore */ }
@@ -498,6 +508,481 @@ async function doBackup() {
 /* ------------------------------------------------------------------ */
 /* 选股                                                                */
 /* ------------------------------------------------------------------ */
+
+/* ---- 通达信策略（tqcenter 条件选股公式） ---------------------------
+   后端直连正在运行的 TdxW.exe，用客户端内置公式全市场选股（约 5~15s，
+   随「回看窗口」变：500 根约 12s、30 根约 6s），
+   命中名单再交给与「本地筛选」同一条展示管线，所以两张 tab 共用结果表、
+   分布卡与抽屉，只有「条件来源」不同。
+
+   ⚠️ **取数触发点只有「执行策略」按钮**：页面打开、换公式、改信号日 / 窗口 /
+   参数都**不会**自动调用公式（一次全市场 500 根约 12s，且独占后端引擎锁，
+   并发请求会排队）。控件改过之后只落一条「待执行」提示，
+   结果表继续显示上一次的数据，由用户决定何时重算。                      */
+
+/** 拉取公式清单（含每个公式的参数名/范围/默认值）。 */
+async function loadTdxFormulas(opts = {}) {
+  const sel = $('#tFormulaSel');
+  if (!sel) return null;
+  try {
+    const d = await api('/api/tdx_formulas?type=1');
+    if (!d.ok) {
+      state.tdxFormulas = [];
+      state.tdxFormula = '';
+      sel.innerHTML = '<option value="">（公式不可用）</option>';
+      sel.disabled = true;
+      $('#tParams').innerHTML = `<span class="tp-note">${esc(d.reason || '通达信公式引擎不可用')}</span>`;
+      $('#tEngine').hidden = true;
+      if (opts.notify !== false) toast('通达信公式不可用：' + (d.reason || '未知原因'), 'err');
+      return d;
+    }
+    state.tdxFormulas = d.formulas || [];
+    state.tdxWindow = Number((d.engine || {}).window) || state.tdxWindow || 500;
+    state.tdxMaxWindow = Number((d.engine || {}).max_window) || state.tdxMaxWindow || 500;
+    const win = $('#tWindow');
+    if (win) { win.value = state.tdxWindow; win.max = state.tdxMaxWindow; }
+    applyTdxDateBounds();
+    sel.disabled = false;
+    renderTdxFormulaSelect();
+    if (opts.notify) toast(`已加载 ${d.count} 个通达信条件选股公式`, 'ok');
+    return d;
+  } catch (e) {
+    if (opts.notify !== false) toast('加载公式清单失败：' + e.message, 'err');
+    return null;
+  }
+}
+
+/** 填公式下拉：系统公式 / 自定义公式两组；文案用「名称 · 代码」。 */
+function renderTdxFormulaSelect() {
+  const sel = $('#tFormulaSel');
+  if (!sel) return;
+  const keep = state.tdxFormula || sel.value;
+  const label = (f) => (f.name && f.name !== f.code ? `${f.name} · ${f.code}` : f.code);
+  const opt = (f) => `<option value="${esc(f.code)}">${esc(label(f))}</option>`;
+  const sys = state.tdxFormulas.filter((f) => f.is_sys);
+  const own = state.tdxFormulas.filter((f) => !f.is_sys);
+  sel.innerHTML =
+    (sys.length ? `<optgroup label="系统公式（${sys.length}）">${sys.map(opt).join('')}</optgroup>` : '')
+    + (own.length ? `<optgroup label="自定义公式（${own.length}）">${own.map(opt).join('')}</optgroup>` : '');
+  const codes = state.tdxFormulas.map((f) => f.code);
+  // 默认公式：清单按 acCode 排序，头几个是「A001 低动态市盈率选股」这类**依赖
+  // 财务数据**的公式，客户端没下财务包时会空跑。UPN（连涨数天）纯价量、结果稳，
+  // 又是官方示例用的公式，更适合当首次进入的落点。
+  const preferred = 'UPN';
+  state.tdxFormula = codes.includes(keep) ? keep
+    : (codes.includes(preferred) ? preferred : (codes[0] || ''));
+  sel.value = state.tdxFormula;
+  renderTdxParams();
+  updateStNote();
+}
+
+/** 按公式的 Para 元信息生成参数输入框。
+    注意：**空参数会让公式直接失效**（实测 MA买入 不传参数时全市场 0 命中），
+    所以一律用公式自带的 Default 预填，而不是留空。 */
+function renderTdxParams() {
+  const box = $('#tParams');
+  if (!box) return;
+  const f = (state.tdxFormulas || []).find((x) => x.code === state.tdxFormula);
+  if (!f) { box.innerHTML = ''; return; }
+  const ps = f.paras || [];
+  if (!ps.length) { box.innerHTML = '<span class="tp-note">该公式无参数</span>'; return; }
+  box.innerHTML = ps.map((p, i) => {
+    const lo = trimNum(p.min); const hi = trimNum(p.max); const dv = trimNum(p.default);
+    return `
+    <label class="tp"><span>${esc(p.name || ('参数' + (i + 1)))}<i>（${esc(lo)}~${esc(hi)}）</i></span>
+      <input type="number" class="tParam" data-i="${i}" step="any"
+             min="${esc(p.min)}" max="${esc(p.max)}" value="${esc(dv)}"
+             title="默认 ${esc(dv)}，范围 ${esc(lo)} ~ ${esc(hi)}" />
+    </label>`;
+  }).join('');
+}
+
+function tdxScreenParams() {
+  const markets = Array.from(document.querySelectorAll('.tMk:checked')).map((o) => o.value);
+  const boards = Array.from(document.querySelectorAll('.tBd:checked')).map((o) => o.value);
+  const args = Array.from(document.querySelectorAll('.tParam'))
+    .map((inp) => String(inp.value).trim()).join(',');
+  const win = Number($('#tWindow') && $('#tWindow').value);
+  return {
+    formula: state.tdxFormula,
+    args,
+    // 留空 = 最新交易日（公式窗口的最后一根）
+    signal_date: ($('#tDate') && $('#tDate').value) || undefined,
+    window: isFinite(win) && win > 0 ? win : undefined,
+    markets,
+    boards,
+    min_amount: (Number($('#tMinAmount').value) || 0) * 1e8,
+    max_float_mcap: Number($('#tMaxFloatMcap').value) || 0,
+    exclude_st: $('#tExcludeSt').checked,
+    max_results: Number($('#tMaxResults').value) || 300,
+    // ⚠️ 行业 / 概念**不进公式请求**：这两个筛选只由下方分布卡驱动，
+    //    而公式一次全市场要 10~12s 且独占引擎锁 —— 点个 chip 就重跑太亏。
+    //    所以「执行策略」一律取**未按行业/概念收敛**的全量命中表，
+    //    控件变化交给 applyScreenFilter() 在已取回的结果上做子集运算
+    //    （见 tdxLocalView）。后端仍然支持这两个键，只是本页不再走那条路。
+    sell_profit: 0.045,
+  };
+}
+
+/* 「信号日」的可选范围 = 公式回看窗口覆盖的交易日（末尾 N 个交易日）。
+   首次进入时后端还没跑过公式，但本地交易日历与客户端同源，先按配置里的
+   window 预置边界；每次跑完再用公式返回的真实区间校正一次。 */
+function applyTdxDateBounds(engine) {
+  const el = $('#tDate');
+  if (!el) return;
+  let lo = (engine && engine.date_start) || '';
+  let hi = (engine && engine.date_end) || '';
+  if (!lo || !hi) {
+    const dts = state.tradeDates || [];
+    if (!dts.length) return;
+    const w = Math.max(1, Number(state.tdxWindow) || 500);
+    hi = dts[dts.length - 1];
+    lo = dts[Math.max(0, dts.length - w)];
+  }
+  el.min = lo;
+  el.max = hi;
+  el.title = `留空＝最新交易日；可选 ${lo} ~ ${hi}（公式回看窗口内）`;
+}
+
+/* ---- 通达信策略的「本地收敛」-----------------------------------------
+   行业 / 概念分布卡在两个模式下共用，但**点 chip 的代价完全不同**：
+   - 本地筛选：本来就要重扫本地行情（毫秒级），chip 直接重跑；
+   - 通达信策略：重跑 = 再调一次全网公式（10~12s，还独占客户端引擎锁）。
+   所以 tdx 模式下 chip 只在**已取回的全量命中表**上做子集运算。
+   注意 `industry_l2` / `concepts` 是 screen() 逐行带出来的（不依赖筛选），
+   所以本地判等与后端 `industries` / `concepts` 过滤口径一致。 */
+
+/** 单行是否落在当前行业 / 概念筛选里（口径与后端 screen() 对齐）。 */
+function tdxRowMatch(r) {
+  if (state.indFilter && (r.industry_l2 || '') !== state.indFilter) return false;
+  const cps = conceptList();
+  if (cps.length) {
+    const has = r.concepts || [];
+    const mode = ($('#fConceptMode') && $('#fConceptMode').value) || 'any';
+    if (mode === 'all') {
+      if (!cps.every((c) => has.indexOf(c) >= 0)) return false;   // 全部命中
+    } else if (!cps.some((c) => has.indexOf(c) >= 0)) return false; // 任一命中
+  }
+  return true;
+}
+
+/** 按当前行业 / 概念控件把「全量命中表」收敛成要展示的视图。
+    无筛选时原样返回（省掉一次数组复制）；否则返回浅拷贝，
+    `matched` / `total_hits` 换成收敛后的行数，分布卡基数（`summary_base`）
+    与两张分布卡的 `groups` 保持不动 —— 点了一个 chip 后其余 chip 仍在。 */
+function tdxLocalView(base) {
+  if (!base || !base.rows) return base;
+  const active = !!state.indFilter || conceptList().length > 0;
+  if (!active) return base;
+  const rows = base.rows.filter(tdxRowMatch);
+  return Object.assign({}, base, {
+    rows,
+    matched: rows.length,
+    total_hits: rows.length,
+    tdx_local_base: base.rows.length,
+    // 缺分类被排除的只数（后端只在它自己过滤时统计，这里补上本地口径）
+    industry_filtered_missing: state.indFilter
+      ? base.rows.filter((r) => !r.industry_l2).length : 0,
+    concept_filtered_missing: conceptList().length
+      ? base.rows.filter((r) => !(r.concepts || []).length).length : 0,
+  });
+}
+
+/** 行业 / 概念筛选的**唯一入口**（chip、清除按钮、输入框都走这里）：
+    tdx → 本地收敛（不碰公式）；local → 服务端重算。 */
+function applyScreenFilter() {
+  if (state.screenMode === 'tdx') {
+    const base = state.screenResult.tdx;
+    if (!base) { updateStNote(); return; }   // 还没执行过策略，等按钮
+    paintScreenResult(base, 'tdx');
+    return;
+  }
+  return runScreen();
+}
+
+/* 两个模式共用同一块结果区（表格 / 分布卡 / 抽屉），所以切 tab 时要把各自的
+   快照重新画一遍 —— 否则在「本地筛选」里会看到「通达信策略」的结果。 */
+const trimNum = (v) => {
+  const n = Number(v);
+  if (!isFinite(n)) return String(v);
+  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(4)));
+};
+
+function paintScreenResult(d, mode) {
+  if (!d) { clearScreenResult(); return; }
+  // tdx：行业 / 概念在**本地**收敛（点 chip 不重跑公式）；local：后端已按条件筛过
+  const view = mode === 'tdx' ? tdxLocalView(d) : d;
+  state.rows = view.rows || [];
+  state.indSummary = view.industry_summary || [];
+  state.conceptSummary = view.concept_summary || [];
+  const condBox = mode === 'tdx' ? $('#tConditions') : $('#conditions');
+  let condHtml = (d.conditions || []).map((c) => `<li>${esc(c)}</li>`).join('');
+  // 请求里已不带行业 / 概念（本页改成纯本地收敛），所以条件清单会一直显示
+  // 「不限二级行业 / 不限概念」—— 这里补一条本地口径，免得看着自相矛盾。
+  if (mode === 'tdx' && view !== d) {
+    const cps = conceptList();
+    const cMode = ($('#fConceptMode') && $('#fConceptMode').value) === 'all'
+      ? '全部命中' : '任一命中';
+    const bits = [];
+    if (state.indFilter) bits.push(`二级行业「${state.indFilter}」`);
+    if (cps.length) bits.push(`概念「${cps.join('/')}」（${cMode}）`);
+    condHtml += `<li>${esc(`行业 / 概念收敛（本地，不重跑公式）：${bits.join('，')}`
+      + ` → ${view.rows.length} 只`)}</li>`;
+  }
+  if (condBox) condBox.innerHTML = condHtml;
+  const truncated = d.truncated
+    ? `（共命中 ${d.total_hits} 只，已截取前 ${d.matched} 只）` : '';
+  if (mode === 'tdx') {
+    renderTdxEngine(d);
+    const g = d.engine || {};
+    const f = (state.tdxFormulas || []).find((x) => x.code === g.formula);
+    const label = f ? f.name : (g.formula_name || g.formula || state.tdxFormula);
+    // 本地收敛只能在已取回的 d.matched 行里做 —— 被截断时说清楚，
+    // 否则用户会以为「这个行业总共就只命中这么几只」
+    const local = view !== d
+      ? ` → 行业/概念收敛后 ${view.rows.length} 只`
+        + (d.truncated ? `（仅在前 ${d.matched} 只内，调大「最多返回」可看全）` : '')
+      : '';
+    $('#screenMeta').textContent =
+      `「${label}」命中 ${d.matched} 只${truncated}${local}`
+      + (g.scanned ? ` · 公式扫 ${g.scanned} 只` : '')
+      + (d.total_scanned ? ` → 本地过滤后 ${d.total_scanned} 只` : '')
+      + ` · 信号日 ${g.date || d.last_date || '-'}`
+      + ` · ${d.screen_elapsed || 0}s`;
+  } else {
+    const ma = (d.params || {}).ma_window;
+    if (ma != null) {
+      const maTh = document.querySelector('#screenTable th[data-w="ma"]');
+      if (maTh) maTh.dataset.label = `${ma}日均量(万手)`;
+    }
+    $('#screenMeta').textContent =
+      `命中 ${d.matched} 只${truncated} · 扫描 ${d.total_scanned} 只`
+      + (d.total_universe ? ` / 全市场 ${d.total_universe} 只` : '')
+      + ` · 最新 ${d.last_date || '-'} · ${d.screen_elapsed || 0}s`;
+  }
+  renderIndustrySummary(view);
+  renderConceptSummary(view);
+  renderSortHeaders();
+  renderScreen();
+}
+
+function clearScreenResult() {
+  state.rows = [];
+  state.indSummary = [];
+  state.conceptSummary = [];
+  if ($('#conditions')) $('#conditions').innerHTML = '';
+  if ($('#tConditions')) $('#tConditions').innerHTML = '';
+  if ($('#tEngine')) { $('#tEngine').hidden = true; $('#tEngine').innerHTML = ''; }
+  if ($('#screenMeta')) $('#screenMeta').textContent = '';
+  renderIndustrySummary({ industry_summary: [] });
+  renderConceptSummary({ concept_summary: [] });
+  renderSortHeaders();
+  renderScreen();
+}
+
+/** 引擎回执条：公式 / 参数 / 信号日 / 窗口 / 命中数 / 耗时。 */
+function renderTdxEngine(data) {
+  const box = $('#tEngine');
+  if (!box) return;
+  const g = data.engine || {};
+  box.hidden = false;
+  box.classList.remove('err');
+  const span = g.window && g.date_start
+    ? `${esc(String(g.date_start).slice(5))}~${esc(String(g.date_end).slice(5))}（${g.window} 日）`
+    : (g.window ? `${g.window} 日` : '-');
+  const parts = [
+    `<span>公式 <b>${esc(g.formula_name || g.formula || '-')}</b>`
+      + (g.formula ? ` <span>(${esc(g.formula)})</span>` : '') + '</span>',
+    `<span>参数 <b>${esc(g.args || '—')}</b></span>`,
+    `<span>信号日 <b>${esc(g.date || '-')}</b></span>`,
+    `<span>回看窗口 <b>${span}</b></span>`,
+    `<span>公式命中 <b class="eg-up">${g.hits != null ? g.hits : 0}</b> 只</span>`,
+    `<span>公式耗时 <b>${g.elapsed != null ? g.elapsed : 0}s</b></span>`,
+    `<span>端到端 <b>${data.screen_elapsed != null ? data.screen_elapsed : 0}s</b></span>`,
+  ];
+  if (data.tdx_notice) parts.push(`<span class="eg-warn">注意：${esc(data.tdx_notice)}</span>`);
+  box.innerHTML = parts.join('');
+}
+
+/** 标记「控件改过、结果已陈旧」：本页只有「执行策略」能触发公式取数，
+    所以换公式 / 改信号日 / 改窗口 / 改参数只更新控件与参数面板，
+    再落一条提示让用户自己决定何时重算（**不覆盖**上一次的引擎回执）。 */
+function markTdxStale() {
+  state.tdxStale = true;
+  const el = $('#tStale');
+  if (!el) return;
+  el.textContent = state.screenResult.tdx
+    ? '条件已改，点「执行策略」重新计算（表格里还是上一次的结果）'
+    : '点「执行策略」开始计算';
+  el.hidden = false;
+  updateStNote();
+}
+
+function clearTdxStale() {
+  state.tdxStale = false;
+  const el = $('#tStale');
+  if (el) { el.hidden = true; el.textContent = ''; }
+  updateStNote();
+}
+
+async function doTdxScreen() {
+  const btn = $('#btnTdxScreen');
+  if (!state.tdxFormula) {
+    toast('通达信公式不可用（客户端未启动？），可切到「本地筛选」', 'warn');
+    return;
+  }
+  clearTdxStale();   // 真的开始算了，陈旧提示就撤掉
+  const f = (state.tdxFormulas || []).find((x) => x.code === state.tdxFormula);
+  const label = f ? f.name : state.tdxFormula;
+  const day = ($('#tDate') && $('#tDate').value) || '';
+  const eng = $('#tEngine');
+  if (btn) { btn.disabled = true; btn.textContent = '计算中…'; }
+  if (eng) {
+    eng.hidden = false;
+    eng.classList.remove('err');
+    // 耗时随「回看窗口」走：500 根约 12s、30 根约 6s（实测），这里按 40 根/秒粗估
+    const _w = Math.max(1, Number(($('#tWindow') || {}).value) || state.tdxWindow || 500);
+    const _est = Math.max(5, Math.round(_w / 40));
+    eng.innerHTML = `<span>正在调用通达信公式 <b>${esc(label)}</b>`
+      + `（信号日 ${esc(day || '最新交易日')} · 回看 ${esc(_w)} 日）全市场选股…（约 ${_est} 秒）</span>`;
+  }
+  try {
+    const data = await api('/api/tdx_screen', { method: 'POST', body: tdxScreenParams() });
+    state.tdxEngine = data.engine || null;
+    if (!data.ok) {
+      if (eng) {
+        eng.classList.add('err');
+        eng.innerHTML = `<span>× ${esc(data.reason || '公式选股失败')}</span>`;
+      }
+      // 失败也要修边界；指定日落在窗口外时清空，回落到最新交易日
+      applyTdxDateBounds(data.engine);
+      if (day && day.value && day.min && day.max
+          && (day.value < day.min || day.value > day.max)) {
+        day.value = '';
+      }
+      state.screenResult.tdx = null;
+      if (state.screenMode === 'tdx') clearScreenResult();
+      toast('公式选股失败：' + (data.reason || '未知原因'), 'err');
+      return;
+    }
+    state.screenResult.tdx = data;
+    applyTdxDateBounds(data.engine);   // 用公式返回的真实窗口校正可选边界
+    // 信号日回落到别的交易日时要让用户看见，别默默换了日子
+    if (data.tdx_notice) toast(data.tdx_notice, 'warn');
+    if (state.screenMode === 'tdx') paintScreenResult(data, 'tdx');
+    toast(`「${label}」命中 ${data.matched} 只${data.truncated ? `（截取，共 ${data.total_hits} 只）` : ''}`,
+      data.matched ? 'ok' : 'warn');
+  } catch (e) {
+    if (eng) {
+      eng.classList.add('err');
+      eng.innerHTML = `<span>× ${esc(e.message)}</span>`;
+    }
+    toast('公式选股失败：' + e.message, 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '执行策略'; }
+  }
+}
+
+/** 两个模式共用的「重跑」入口。注意**行业 / 概念 chip 不走这里** ——
+    那个走 applyScreenFilter()：tdx 下只在已取回的结果上本地收敛。 */
+function runScreen() {
+  return state.screenMode === 'tdx' ? doTdxScreen() : doScreen();
+}
+
+function setScreenMode(mode) {
+  state.screenMode = mode === 'local' ? 'local' : 'tdx';
+  document.querySelectorAll('#stTabs .bp-tab').forEach((b) => {
+    const on = b.dataset.st === state.screenMode;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  const tdx = $('#stPaneTdx');
+  const loc = $('#stPaneLocal');
+  if (tdx) tdx.hidden = state.screenMode !== 'tdx';
+  if (loc) loc.hidden = state.screenMode !== 'local';
+  updateStNote();
+  // 结果区是共用的，切过去要画对应模式的快照，否则两个 tab 会串结果
+  paintScreenResult(state.screenResult[state.screenMode], state.screenMode);
+}
+
+function updateStNote() {
+  const note = $('#stNote');
+  if (!note) return;
+  const tail = state.tdxStale ? ' · 条件已改，待执行' : '';
+  if (state.screenMode === 'tdx') {
+    const n = (state.tdxFormulas || []).length;
+    const picked = [];
+    if (state.indFilter) picked.push(`行业「${state.indFilter}」`);
+    const cps = conceptList();
+    if (cps.length) picked.push(`概念「${cps.join('/')}」`);
+    note.textContent = n
+      ? `通达信客户端内置条件选股公式（${n} 个）：选好公式 / 信号日 / 回看窗口后点「执行策略」；`
+        + `「信号日」留空＝最新交易日，可回看窗口内任意一天；`
+        + `下方行业 / 概念分布卡只在「已取回的结果」上收敛（不重跑公式）`
+        + (picked.length ? ` · 当前收敛：${picked.join('、')}` : '')
+        + tail
+      : '调用通达信客户端内置的条件选股公式，需先启动客户端（TdxW.exe）';
+  } else {
+    note.textContent = '本地行情筛选：均线 / 放量 / 市值 / 行业 / 概念等条件，全部在本地缓存上计算';
+  }
+}
+
+function bindScreenMode() {
+  const tabs = $('#stTabs');
+  if (tabs) {
+    tabs.addEventListener('click', (ev) => {
+      const b = ev.target.closest('.bp-tab');
+      if (b) setScreenMode(b.dataset.st);
+    });
+  }
+  const sel = $('#tFormulaSel');
+  // 换公式只更新参数面板 + 标「待执行」，**不自动选股** —— 取数一律等用户点
+  // 「执行策略」（公式一次全市场 12s，还独占后端引擎锁）。
+  if (sel) sel.onchange = () => {
+    state.tdxFormula = sel.value;
+    renderTdxParams();
+    updateStNote();
+    markTdxStale();
+  };
+  const rel = $('#tReload');
+  if (rel) rel.onclick = () => {
+    rel.disabled = true;
+    // 「刷新」只重新拉公式清单（存量的公式会变），不顺手替你跑一次选股
+    loadTdxFormulas({ notify: true })
+      .then(() => { if (state.tdxFormula) markTdxStale(); })
+      .finally(() => { rel.disabled = false; });
+  };
+  const btn = $('#btnTdxScreen');
+  if (btn) btn.onclick = doTdxScreen;
+  // 信号日 / 回看窗口 / 公式参数：都只标「待执行」，由「执行策略」统一触发。
+  // 非交易日不用前端吸附 —— 后端会吸附到窗口内不晚于它的最近交易日，
+  // 并把实际信号日回传。
+  const day = $('#tDate');
+  if (day) day.onchange = () => markTdxStale();
+  const dayLatest = $('#tDateLatest');
+  if (dayLatest) dayLatest.onclick = () => {
+    if (!day || !day.value) return;
+    day.value = '';
+    markTdxStale();
+  };
+  // 窗口变了 → 可选日期范围跟着变（这一步必须立刻做，否则日期控件会停在
+  // 越界值上），但不重跑公式
+  const win = $('#tWindow');
+  if (win) win.onchange = () => {
+    const v = Number(win.value);
+    if (isFinite(v) && v > 0) state.tdxWindow = v;
+    applyTdxDateBounds();
+    if (day && day.value && (day.value < day.min || day.value > day.max)) day.value = '';
+    markTdxStale();
+  };
+  const params = $('#tParams');
+  // 参数框里回车＝提交，等同于点「执行策略」（这是显式的用户动作，不算自动取数）
+  if (params) params.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doTdxScreen(); }
+  });
+  setScreenMode(state.screenMode);
+}
+
 function screenParams() {
   const markets = Array.from(document.querySelectorAll('.fMk:checked')).map((o) => o.value);
   const boards = Array.from(document.querySelectorAll('.fBd:checked')).map((o) => o.value);
@@ -535,27 +1020,13 @@ async function doScreen() {
         $('#fDate').min = data.date_min;
         $('#fDate').max = data.date_max;
       }
-      $('#conditions').innerHTML = '';
-      state.rows = []; renderScreen();
+      state.screenResult.local = null;
+      if (state.screenMode === 'local') clearScreenResult();
       return;
     }
-    state.rows = data.rows || [];
-    state.indSummary = data.industry_summary || [];
-    state.conceptSummary = data.concept_summary || [];
     state.conceptFilter = ($('#fConcept').value || '').trim();
-    $('#conditions').innerHTML = (data.conditions || []).map((c) => `<li>${esc(c)}</li>`).join('');
-    const ma = data.params.ma_window;
-    const maTh = document.querySelector('#screenTable th[data-w="ma"]');
-    maTh.dataset.label = `${ma}日均量(万手)`;   // 表头文案交给 renderSortHeaders 统一渲染
-    const truncated = data.truncated ? `（共命中 ${data.total_hits} 只，已截取前 ${data.matched} 只）` : '';
-    $('#screenMeta').textContent =
-      `命中 ${data.matched} 只${truncated} · 扫描 ${data.total_scanned} 只`
-      + (data.total_universe ? ` / 全市场 ${data.total_universe} 只` : '')
-      + ` · 最新 ${data.last_date || '-'} · ${data.screen_elapsed || 0}s`;
-    renderIndustrySummary(data);
-    renderConceptSummary(data);
-    renderSortHeaders();
-    renderScreen();
+    state.screenResult.local = data;
+    if (state.screenMode === 'local') paintScreenResult(data, 'local');
     toast(`命中 ${data.matched} 只${data.truncated ? `（截取，共 ${data.total_hits} 只）` : ''}`, data.matched ? 'ok' : 'warn');
   } catch (e) {
     toast('选股失败：' + e.message, 'err');
@@ -601,13 +1072,13 @@ function bindIndustrySummary() {
     const l2 = chip.dataset.l2;
     state.indFilter = state.indFilter === l2 ? '' : l2;
     $('#fIndustry').value = state.indFilter;
-    doScreen();
+    applyScreenFilter();   // tdx → 本地收敛；local → 重跑本地行情
   });
   $('#btnIndClear').onclick = () => {
     if (!state.indFilter) { toast('当前未设置行业筛选', 'warn'); return; }
     state.indFilter = '';
     $('#fIndustry').value = '';
-    doScreen();
+    applyScreenFilter();
   };
 }
 
@@ -653,12 +1124,12 @@ function bindConceptSummary() {
     const next = cur.length === 1 && cur[0] === name ? [] : [name];
     $('#fConcept').value = next.join('，');
     if (next.length) $('#fConceptMode').value = 'any';
-    doScreen();
+    applyScreenFilter();
   });
   $('#btnConceptClear').onclick = () => {
     if (!conceptList().length) { toast('当前未设置概念筛选', 'warn'); return; }
     $('#fConcept').value = '';
-    doScreen();
+    applyScreenFilter();
   };
 }
 
@@ -755,7 +1226,8 @@ function bindScreenSort() {
 function renderScreen() {
   const tb = $('#screenTable tbody');
   if (!state.rows.length) {
-    tb.innerHTML = '<tr><td colspan="14" class="empty">暂无结果，点击「开始选股」</td></tr>';
+    tb.innerHTML = `<tr><td colspan="14" class="empty">暂无结果，${
+      state.screenMode === 'tdx' ? '选择公式后点「执行策略」' : '点击「开始选股」'}</td></tr>`;
     return;
   }
   tb.innerHTML = sortOrder().map((i) => {
@@ -3317,20 +3789,22 @@ async function init() {
   $('#sMinStreak').onchange = loadStreaks;
   $('#sStLimit').onchange = loadStreaks;
   document.querySelectorAll('.sBd').forEach((o) => { o.onchange = loadStreaks; });
-  $('#fIndustry').onchange = (e) => { state.indFilter = e.target.value; doScreen(); };
+  $('#fIndustry').onchange = (e) => { state.indFilter = e.target.value; applyScreenFilter(); };
   // 概念输入框：回车即筛；失焦不改输入（允许慢慢敲完再点选股）
   $('#fConcept').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); doScreen(); }
+    if (e.key === 'Enter') { e.preventDefault(); applyScreenFilter(); }
   });
   $('#fConceptClear').onclick = () => {
     if (!conceptList().length) { toast('当前未设置概念筛选', 'warn'); return; }
     $('#fConcept').value = '';
-    doScreen();
+    applyScreenFilter();
   };
-  $('#fConceptMode').onchange = () => { if (conceptList().length) doScreen(); };
+  $('#fConceptMode').onchange = () => { if (conceptList().length) applyScreenFilter(); };
   $('#fDate').onchange = (e) => snapTradeDate(e.target, { notify: true });
   $('#fDateLatest').onclick = () => { $('#fDate').value = ''; };
   $('#staleReload').onclick = () => location.reload();
+  // ---- 选股页模式 tab（通达信策略 / 本地筛选）----
+  bindScreenMode();
   // ---- 板块看盘 ----
   bindBoard();
   // ---- 自选板块 ----
@@ -3364,9 +3838,19 @@ async function init() {
   document.addEventListener('visibilitychange', () => { if (!document.hidden) loadVersion(); });
 
   const s = await api('/api/status').catch(() => null);
-  const autoScreen = !(boot && boot.settings && boot.settings.auto_screen === false);
-  if (autoScreen && s && s.cache && s.cache.exists) {
-    await doScreen();                 // 自动跑一次选股，不用手点
+  const cacheOk = !!(s && s.cache && s.cache.exists);
+  // ⚠️ 打开页面**不自动跑通达信策略**：取数只认「执行策略」按钮
+  //    （一次全市场公式 500 根约 12s，且独占后端引擎锁，并发只会排队）。
+  //    这里只把公式清单铺好（下拉有东西可选、参数面板按默认值预填），
+  //    顺带顺手探测一下客户端在不在。
+  if (state.screenMode === 'local') {
+    const autoScreen = !(boot && boot.settings && boot.settings.auto_screen === false);
+    if (autoScreen && cacheOk) await runScreen();
+  } else {
+    // 公式清单**不算选股结果**，不影响「不自动取数」；不发这一枪下拉就是空的
+    loadTdxFormulas({ notify: false }).catch(() => {});
+  }
+  if (cacheOk) {
     loadPlans().catch(() => {});      // 计划 / 追踪也一并预取，切页即见
     loadWatch().catch(() => {});
   }

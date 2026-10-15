@@ -1,9 +1,18 @@
 {
-  "tdx_dir": "D:\\new_tdx",
+  "tdx_dir": "D:\\new_tdx64",
   "host": "127.0.0.1",
   "port": 8778,
   "reader_mode": "fast",
   "names_csv": "",
+  "tdx_quant": {
+    "enabled": true,
+    "sdk_dir": "",
+    "dll_path": "",
+    "window": 500,
+    "max_window": 500,
+    "dividend_type": 1,
+    "timeout_warn": 30
+  },
   "screen": {
     "ma_window": 20,
     "volume_ratio": 2.0,

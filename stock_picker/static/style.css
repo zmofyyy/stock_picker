@@ -808,3 +808,52 @@ tbody tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 #wbSelect { min-width: 150px; max-width: 220px; }
 /* KPI 卡默认没有上边距（板块看盘那边靠 .bp-split 的 gap 分开） */
 #wbKpiCard { margin-top: 0; }
+
+/* ------------------------------------------------------------------ */
+/* 选股页：模式 tab（通达信策略 / 本地筛选）                            */
+/* ------------------------------------------------------------------ */
+.filters .tdx-field { display: flex; align-items: center; gap: 6px; }
+.filters .tdx-field select {
+  min-width: 300px; max-width: 460px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid rgba(255, 255, 255, .12); border-radius: 6px;
+  padding: 6px 8px; font-size: 12.5px; outline: none;
+  transition: border-color 200ms;
+}
+.filters .tdx-field select:focus { border-color: var(--accent); }
+
+/* 公式参数：按 tqcenter 的 Para 元信息动态生成（名称 / 范围 / 默认值） */
+.tdx-params {
+  display: flex; flex-wrap: wrap; gap: 10px 16px;
+  align-items: flex-end; padding: 2px 0 10px;
+}
+.tdx-params:empty { display: none; }
+.tdx-params .tp { display: flex; flex-direction: column; gap: 4px; }
+.tdx-params .tp > span { font-size: 11.5px; color: var(--muted); }
+.tdx-params .tp > span i { font-style: normal; opacity: .75; }
+.tdx-params .tp input {
+  width: 112px; background: var(--surface); color: var(--text);
+  border: 1px solid rgba(255, 255, 255, .12); border-radius: 6px;
+  padding: 6px 8px; font-size: 12.5px; font-family: var(--font-mono); outline: none;
+  transition: border-color 200ms;
+}
+.tdx-params .tp input:focus { border-color: var(--accent); }
+.tdx-params .tp-note { font-size: 11.5px; color: var(--muted); padding-bottom: 7px; }
+
+/* 引擎回执：公式名 / 参数 / 信号日 / 命中数 / 耗时 */
+.tdx-engine {
+  display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center;
+  padding: 0 0 8px; font-size: 12px; color: var(--muted);
+}
+.tdx-engine[hidden] { display: none; }
+.tdx-engine b { color: var(--text); font-weight: 600; }
+.tdx-engine .eg-up { color: #ff453a; }
+.tdx-engine .eg-warn { color: #ff9f0a; }
+.tdx-engine.err { color: #ff453a; }
+
+/* 「待执行」提示：改公式 / 信号日 / 窗口 / 参数后不再自动重跑，只落这一行；
+   用警示色是为了跟引擎回执（灰色）区分开 —— 结果表里还是上一次的数据。 */
+.tdx-stale {
+  padding: 0 0 8px; font-size: 12px; color: #ff9f0a;
+}
+.tdx-stale[hidden] { display: none; }
